@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+.env
+botinfo.db
+*.sqlite3

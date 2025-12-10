@@ -3,6 +3,7 @@ import sqlite3
 from pathlib import Path
 from datetime import datetime
 
+from collections import deque
 from dotenv import load_dotenv
 
 # ================== ПУТИ И ENV ==================
@@ -71,6 +72,108 @@ def init_db():
 
     conn.commit()
     conn.close()
+
+
+def migrate_csv_to_db():
+    """
+    Одноразовая миграция старого trades.csv в таблицу trades.
+    Выполняется только если таблица пустая и CSV существует.
+    """
+    csv_path = BASE_DIR / "trades.csv"
+    if not csv_path.exists():
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM trades;")
+    existing_rows = cur.fetchone()[0]
+    if existing_rows > 0:
+        conn.close()
+        return
+
+    try:
+        import pandas as pd  # локальный импорт, чтобы не падать, если pandas отсутствует
+        df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+    except Exception:
+        conn.close()
+        return
+
+    required_cols = {"type", "symbol", "price", "amount", "usd_value"}
+    if not required_cols.issubset(df.columns):
+        conn.close()
+        return
+
+    if "pnl_pct" not in df.columns:
+        df["pnl_pct"] = 0.0
+    if "pnl_usd" not in df.columns:
+        df["pnl_usd"] = 0.0
+
+    if "time" in df.columns:
+        df["time_utc"] = pd.to_datetime(df["time"], errors="coerce")
+    else:
+        df["time_utc"] = pd.NaT
+
+    df["time_utc"] = df["time_utc"].fillna(pd.Timestamp.utcnow())
+
+    rows = [
+        (
+            row["type"],
+            row["symbol"],
+            float(row["price"]),
+            float(row["amount"]),
+            float(row["usd_value"]),
+            float(row.get("pnl_pct", 0.0)),
+            float(row.get("pnl_usd", 0.0)),
+            row["time_utc"].isoformat(),
+        )
+        for _, row in df.iterrows()
+    ]
+
+    cur.executemany(
+        """
+        INSERT INTO trades (type, symbol, price, amount, usd_value, pnl_pct, pnl_usd, time_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_trades_dataframe():
+    """
+    Возвращает DataFrame с колонкой time (UTC) из таблицы trades.
+    """
+    if not DB_PATH.exists():
+        return pd.DataFrame(
+            columns=[
+                "type",
+                "symbol",
+                "price",
+                "amount",
+                "usd_value",
+                "pnl_pct",
+                "pnl_usd",
+                "time",
+            ]
+        )
+
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query(
+        """
+        SELECT type, symbol, price, amount, usd_value, pnl_pct, pnl_usd, time_utc
+        FROM trades
+        """,
+        conn,
+        parse_dates=["time_utc"],
+    )
+    conn.close()
+
+    if df.empty:
+        return df
+
+    df = df.rename(columns={"time_utc": "time"})
+    return df
 
 
 def log_trade_sql(
@@ -170,6 +273,172 @@ DEFAULT_SYMBOL = COINS["BTC"]
 
 PAIR_URL_TEMPLATE = "https://bingx.com/en/spot/{pair}"
 
+SELL_KEYWORDS = [
+    "SELL",
+    "STOP",
+    "TAKE",
+    "FORCE",
+    "MANUAL_SELL",
+    "MANUAL_POSITION_CLOSE",
+    "MANUAL_EXTERNAL_CLOSE",
+    "AUTO_SELL",
+]
+SELL_PATTERN = "|".join(SELL_KEYWORDS)
+
+# ================== АДАПТИВНАЯ СТРАТЕГИЯ ПО МОНЕТАМ ==================
+# Автоадаптация “мягкости/жесткости” условий по каждой монете отдельно.
+ADAPTIVE_STATE = {}  # symbol -> dict
+GLOBAL_START_MODE = "normal"  # "soft" | "normal" | "hard"
+
+MAX_RISK_LEVEL = 3
+MIN_RISK_LEVEL = -3
+MIN_TRADES_BEFORE_AUTO = 5
+
+
+def init_adaptive_state():
+    """
+    Инициализирует адаптацию для всех символов. Вызывать после load_state().
+    """
+    global ADAPTIVE_STATE
+    if not ADAPTIVE_STATE:
+        ADAPTIVE_STATE = {}
+        for symbol in SYMBOLS:
+            ADAPTIVE_STATE[symbol] = {
+                "risk_level": 0,
+                "manual_mode": "normal",
+                "trades_in_manual_mode": 0,
+                "last_pnls": deque(maxlen=20),
+            }
+    else:
+        # Пополняем отсутствующие символы
+        for symbol in SYMBOLS:
+            ADAPTIVE_STATE.setdefault(
+                symbol,
+                {
+                    "risk_level": 0,
+                    "manual_mode": "normal",
+                    "trades_in_manual_mode": 0,
+                    "last_pnls": deque(maxlen=20),
+                },
+            )
+
+
+def _apply_manual_preset(preset: str):
+    """
+    Включает ручной пресет ("soft" / "normal" / "hard") для ВСЕХ монет.
+    После MIN_TRADES_BEFORE_AUTO сделок по монете включается автоадаптация.
+    """
+    global GLOBAL_START_MODE
+    GLOBAL_START_MODE = preset
+
+    for symbol in SYMBOLS:
+        st = ADAPTIVE_STATE.setdefault(
+            symbol,
+            {
+                "risk_level": 0,
+                "manual_mode": "normal",
+                "trades_in_manual_mode": 0,
+                "last_pnls": deque(maxlen=20),
+            },
+        )
+        st["manual_mode"] = preset
+        st["trades_in_manual_mode"] = 0
+        st["last_pnls"] = deque(maxlen=20)
+
+        if preset == "soft":
+            st["risk_level"] = -1
+        elif preset == "hard":
+            st["risk_level"] = 1
+        else:
+            st["risk_level"] = 0
+
+
+def set_soft_start_mode():
+    _apply_manual_preset("soft")
+
+
+def set_normal_start_mode():
+    _apply_manual_preset("normal")
+
+
+def set_hard_start_mode():
+    _apply_manual_preset("hard")
+
+
+def adaptive_on_trade(symbol: str, trade_type: str, pnl_pct: float):
+    """
+    Вызывается при закрытии сделки (SELL-типы). Корректирует risk_level.
+    """
+    if symbol not in ADAPTIVE_STATE:
+        return
+
+    st = ADAPTIVE_STATE[symbol]
+    st["last_pnls"].append(pnl_pct)
+
+    if not any(kw in trade_type for kw in SELL_KEYWORDS):
+        return
+
+    if st["manual_mode"] is not None:
+        st["trades_in_manual_mode"] += 1
+        if st["trades_in_manual_mode"] >= MIN_TRADES_BEFORE_AUTO:
+            st["manual_mode"] = None  # переходим в автоадаптацию
+        return
+
+    rl = st.get("risk_level", 0)
+
+    if pnl_pct <= -0.3:
+        rl = min(rl + 1, MAX_RISK_LEVEL)
+    elif pnl_pct >= 0.5:
+        rl = max(rl - 1, MIN_RISK_LEVEL)
+
+    if len(st["last_pnls"]) >= 5:
+        last5 = list(st["last_pnls"])[-5:]
+        avg5 = sum(last5) / len(last5)
+        if avg5 < -0.2:
+            rl = min(rl + 1, MAX_RISK_LEVEL)
+        elif avg5 > 0.5:
+            rl = max(rl - 1, MIN_RISK_LEVEL)
+
+    st["risk_level"] = rl
+
+
+def get_symbol_config(symbol: str) -> dict:
+    """
+    Возвращает базовый конфиг с учётом risk_level монеты.
+    """
+    base = dict(STRATEGY_CONFIG)
+    st = ADAPTIVE_STATE.get(symbol)
+    if not st:
+        return base
+
+    rl = max(MIN_RISK_LEVEL, min(MAX_RISK_LEVEL, st.get("risk_level", 0)))
+    risk_factor = 1.0 - 0.1 * rl
+    entry_factor = 1.0 + 0.2 * (-rl)
+
+    base["sl_pct"] = max(0.003, min(0.1, base["sl_pct"] * risk_factor))
+    base["tp_pct"] = max(0.005, min(0.25, base["tp_pct"] * (1.0 + 0.05 * (-rl))))
+
+    base["volume_mult"] = max(1.0, base["volume_mult"] / max(0.5, entry_factor))
+    base["price_growth_min"] = max(
+        0.0001, base["price_growth_min"] / max(0.5, entry_factor)
+    )
+
+    base_min_int = base["min_interval_sec"]
+    if rl > 0:
+        base["min_interval_sec"] = int(base_min_int * (1.0 + 0.2 * rl))
+    elif rl < 0:
+        base["min_interval_sec"] = max(30, int(base_min_int * (1.0 + 0.1 * rl)))
+
+    rsi_min_new = max(10, min(80, base["rsi_min"] - 3 * rl))
+    rsi_max_new = max(20, min(90, base["rsi_max"] + 3 * (-rl)))
+    if rsi_max_new <= rsi_min_new:
+        rsi_max_new = rsi_min_new + 5
+
+    base["rsi_min"] = rsi_min_new
+    base["rsi_max"] = rsi_max_new
+
+    return base
+
 # ================== STATE ==================
 positions = {
     sym: {"in_position": False, "entry_price": 0.0, "amount": 0.0, "buy_time": None}
@@ -188,8 +457,8 @@ ACTIVE_COINS = {sym: True for sym in SYMBOLS}
 TRADE_DEPOSITS = {
     COINS["BTC"]: 10.0,
     COINS["ETH"]: 10.0,
-    COINS["SOL"]: 3.0,
-    COINS["XRP"]: 3.0,
+    COINS["SOL"]: 10.0,
+    COINS["XRP"]: 10.0,
 }
 
 current_prices = {sym: 0.0 for sym in SYMBOLS}
@@ -232,6 +501,16 @@ def save_state():
         "active_coins": ACTIVE_COINS,
         "trade_deposits": TRADE_DEPOSITS,
         "manual_seen_trade_ids": list(manual_seen_trade_ids),
+        "adaptive_state": {
+            sym: {
+                "risk_level": st.get("risk_level", 0),
+                "manual_mode": st.get("manual_mode"),
+                "trades_in_manual_mode": st.get("trades_in_manual_mode", 0),
+                "last_pnls": list(st.get("last_pnls", [])),
+            }
+            for sym, st in ADAPTIVE_STATE.items()
+        },
+        "global_start_mode": GLOBAL_START_MODE,
     }
     with open("state.json", "w") as f:
         json.dump(state, f)
@@ -240,7 +519,7 @@ def save_state():
 def load_state():
     global positions, last_price, STRATEGY_CONFIG
     global day_open_price, day_open_msk_date, ACTIVE_COINS, TRADE_DEPOSITS
-    global manual_seen_trade_ids
+    global manual_seen_trade_ids, ADAPTIVE_STATE, GLOBAL_START_MODE
 
     if os.path.exists("state.json"):
         try:
@@ -293,6 +572,21 @@ def load_state():
                 if isinstance(saved_manual_ids, list):
                     manual_seen_trade_ids = set(saved_manual_ids)
 
+                saved_adapt = state.get("adaptive_state", {})
+                if isinstance(saved_adapt, dict):
+                    for sym in SYMBOLS:
+                        raw = saved_adapt.get(sym, {})
+                        ADAPTIVE_STATE[sym] = {
+                            "risk_level": int(raw.get("risk_level", 0)),
+                            "manual_mode": raw.get("manual_mode", "normal"),
+                            "trades_in_manual_mode": int(
+                                raw.get("trades_in_manual_mode", 0)
+                            ),
+                            "last_pnls": deque(raw.get("last_pnls", []), maxlen=20),
+                        }
+
+                GLOBAL_START_MODE = state.get("global_start_mode", "normal")
+
         except Exception:
             positions.clear()
             for sym in SYMBOLS:
@@ -306,12 +600,32 @@ def load_state():
 
 
 def log_trade(trade_data):
-    trade_data["time"] = datetime.utcnow().isoformat()
-    df = pd.DataFrame([trade_data])
-    if os.path.exists("trades.csv"):
-        df.to_csv("trades.csv", mode="a", header=False, index=False)
-    else:
-        df.to_csv("trades.csv", index=False)
+    """
+    Запись сделки в SQLite и фиксация результата для адаптации.
+    Ожидает словарь с ключами type, symbol, price, amount, usd_value и опционально pnl_pct, pnl_usd.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+
+    cur.execute(
+        """
+        INSERT INTO trades (type, symbol, price, amount, usd_value, pnl_pct, pnl_usd, time_utc)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trade_data.get("type"),
+            trade_data.get("symbol"),
+            float(trade_data.get("price", 0.0)),
+            float(trade_data.get("amount", 0.0)),
+            float(trade_data.get("usd_value", 0.0)),
+            float(trade_data.get("pnl_pct", 0.0)),
+            float(trade_data.get("pnl_usd", 0.0)),
+            datetime.utcnow().isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
 
 
 def calculate_indicators(ohlcv):
@@ -395,16 +709,11 @@ def get_market_context(symbol, current_close, cfg, ex):
 
 
 def get_pnl_today():
-    if not os.path.exists("trades.csv"):
+    df = load_trades_dataframe()
+    if df.empty:
         return 0.0, 0.0
 
     try:
-        df = pd.read_csv("trades.csv", engine="python", on_bad_lines="skip")
-
-        required_cols = {"time", "type"}
-        if not required_cols.issubset(df.columns):
-            return 0.0, 0.0
-
         if "pnl_pct" not in df.columns:
             df["pnl_pct"] = 0.0
         if "pnl_usd" not in df.columns:
@@ -430,9 +739,7 @@ def get_pnl_today():
             (df["time"] >= today_utc_start) & (df["time"] < tomorrow_utc_start)
         ]
 
-        sells = today[
-            today["type"].str.contains("SELL|STOP|TAKE|FORCE", na=False)
-        ]
+        sells = today[today["type"].str.contains(SELL_PATTERN, na=False)]
 
         total_pnl_pct = sells["pnl_pct"].sum() if not sells.empty else 0.0
         total_usd = sells["pnl_usd"].sum() if not sells.empty else 0.0
@@ -445,12 +752,11 @@ def get_pnl_today():
 
 
 def get_pnl_today_per_symbol():
-    if not os.path.exists("trades.csv"):
+    df = load_trades_dataframe()
+    if df.empty:
         return {}, 0.0, 0.0
 
     try:
-        df = pd.read_csv("trades.csv", engine="python", on_bad_lines="skip")
-
         required_cols = {"time", "type", "symbol"}
         if not required_cols.issubset(df.columns):
             return {}, 0.0, 0.0
@@ -480,9 +786,7 @@ def get_pnl_today_per_symbol():
             (df["time"] >= today_utc_start) & (df["time"] < tomorrow_utc_start)
         ]
 
-        sells = today[
-            today["type"].str.contains("SELL|STOP|TAKE|FORCE", na=False)
-        ]
+        sells = today[today["type"].str.contains(SELL_PATTERN, na=False)]
 
         if sells.empty:
             return {}, 0.0, 0.0
@@ -548,9 +852,22 @@ def plot_mini_chart(symbol, ohlcv):
 
 
 # ================== TELEGRAM SEND ==================
+def with_start_button(markup=None):
+    start_btn = InlineKeyboardButton("🏠 /start", callback_data="back_to_main")
+    if markup is None:
+        return InlineKeyboardMarkup([[start_btn]])
+    if isinstance(markup, InlineKeyboardMarkup):
+        kb = [list(row) for row in markup.inline_keyboard]
+        if not any(btn.text == start_btn.text for row in kb for btn in row):
+            kb.append([start_btn])
+        return InlineKeyboardMarkup(kb)
+    return markup
+
+
 async def send_telegram(text, photo=None, reply_markup=None):
     try:
         bot = Application.builder().token(TELEGRAM_TOKEN).build().bot
+        reply_markup = with_start_button(reply_markup)
         if photo:
             await bot.send_photo(
                 chat_id=TELEGRAM_CHAT_ID,
@@ -645,19 +962,29 @@ async def cmd_market(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if update.message:
             await update.message.reply_text(
-                msg, parse_mode="HTML", disable_web_page_preview=True
+                msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=with_start_button(),
             )
         else:
             await update.callback_query.message.reply_text(
-                msg, parse_mode="HTML", disable_web_page_preview=True
+                msg,
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+                reply_markup=with_start_button(),
             )
 
     except Exception as e:
         error_msg = f"❌ Ошибка анализа: {e}"
         if update.message:
-            await update.message.reply_text(error_msg)
+            await update.message.reply_text(
+                error_msg, reply_markup=with_start_button()
+            )
         else:
-            await update.callback_query.message.reply_text(error_msg)
+            await update.callback_query.message.reply_text(
+                error_msg, reply_markup=with_start_button()
+            )
 
 
 # ================== START / MAIN MENU ==================
@@ -674,6 +1001,10 @@ def build_main_keyboard():
             ],
             [
                 InlineKeyboardButton("🚪 Выход из сделок", callback_data="positions_menu"),
+            ],
+            [
+                InlineKeyboardButton("⬇️ Мягче старт", callback_data="risk_soft"),
+                InlineKeyboardButton("⬆️ Жёстче старт", callback_data="risk_hard"),
             ],
         ]
     )
@@ -692,9 +1023,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     xrp = float(balance.get("XRP", {}).get("free", 0))
     pnl_pct, pnl_usd = get_pnl_today()
 
-    pos = positions[DEFAULT_SYMBOL]
-    status = "🟢 <b>В позиции</b>" if pos["in_position"] else "🔴 <b>Нет позиции</b>"
-    entry_info = f"\nВход по BTC: {pos['entry_price']:,.2f}" if pos["in_position"] else ""
+    pos_lines = []
+    for code, sym in COINS.items():
+        pos = positions[sym]
+        risk = ADAPTIVE_STATE.get(sym, {}).get("risk_level", 0)
+        adapt_label = f" | риск {risk:+d}"
+        if pos["in_position"]:
+            pos_lines.append(
+                f"🟢 {code}: {pos['amount']:.6f} @ {pos['entry_price']:,.4f}{adapt_label}"
+            )
+        else:
+            pos_lines.append(f"🔴 {code}: нет позиции{adapt_label}")
+    positions_block = "\n".join(pos_lines)
 
     text = (
         f"💼 <b>Текущий баланс</b>\n"
@@ -703,7 +1043,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"ETH: {eth:.6f}\n"
         f"SOL: {sol:.6f}\n"
         f"XRP: {xrp:.2f}\n\n"
-        f"{status}{entry_info}\n\n"
+        f"{positions_block}\n\n"
         f"📊 <b>P&L за день (МСК)</b>\n"
         f"В %: {pnl_pct:+.2f}%\n"
         f"В USDT: ${pnl_usd:+.2f}"
@@ -711,7 +1051,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         text,
-        reply_markup=build_main_keyboard(),
+        reply_markup=with_start_button(build_main_keyboard()),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -733,9 +1073,18 @@ async def start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     xrp = float(balance.get("XRP", {}).get("free", 0))
     pnl_pct, pnl_usd = get_pnl_today()
 
-    pos = positions[DEFAULT_SYMBOL]
-    status = "🟢 <b>В позиции</b>" if pos["in_position"] else "🔴 <b>Нет позиции</b>"
-    entry_info = f"\nВход по BTC: {pos['entry_price']:,.2f}" if pos["in_position"] else ""
+    pos_lines = []
+    for code, sym in COINS.items():
+        pos = positions[sym]
+        risk = ADAPTIVE_STATE.get(sym, {}).get("risk_level", 0)
+        adapt_label = f" | риск {risk:+d}"
+        if pos["in_position"]:
+            pos_lines.append(
+                f"🟢 {code}: {pos['amount']:.6f} @ {pos['entry_price']:,.4f}{adapt_label}"
+            )
+        else:
+            pos_lines.append(f"🔴 {code}: нет позиции{adapt_label}")
+    positions_block = "\n".join(pos_lines)
 
     text = (
         f"💼 <b>Текущий баланс</b>\n"
@@ -744,7 +1093,7 @@ async def start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"ETH: {eth:.6f}\n"
         f"SOL: {sol:.6f}\n"
         f"XRP: {xrp:.2f}\n\n"
-        f"{status}{entry_info}\n\n"
+        f"{positions_block}\n\n"
         f"📊 <b>P&L за день (МСК)</b>\n"
         f"В %: {pnl_pct:+.2f}%\n"
         f"В USDT: ${pnl_usd:+.2f}"
@@ -752,21 +1101,26 @@ async def start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     await query.edit_message_text(
         text,
-        reply_markup=build_main_keyboard(),
+        reply_markup=with_start_button(build_main_keyboard()),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
 # ================== REPORT / PNL BUTTONS ==================
-async def handle_report(query):
+async def handle_report(query, day: str | None = None):
     try:
-        if not os.path.exists("trades.csv"):
-            await query.message.reply_text("📊 Нет данных для отчёта")
+        df = load_trades_dataframe()
+        if df.empty:
+            await query.message.reply_text(
+                "📊 Нет данных для отчёта", reply_markup=with_start_button()
+            )
             return
-        df = pd.read_csv("trades.csv", engine="python", on_bad_lines="skip")
-        if "time" not in df.columns:
-            await query.message.reply_text("❌ Некорректный формат trades.csv")
+        if "time" not in df.columns or "type" not in df.columns:
+            await query.message.reply_text(
+                "❌ Некорректный формат таблицы trades",
+                reply_markup=with_start_button(),
+            )
             return
 
         if "pnl_pct" not in df.columns:
@@ -776,69 +1130,77 @@ async def handle_report(query):
 
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
         df = df.dropna(subset=["time"])
+        df["date"] = df["time"].dt.date
 
-        now_utc = datetime.utcnow()
-        now_msk = now_utc + timedelta(hours=MOSCOW_OFFSET_HOURS)
-        today_msk_start = now_msk.replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
-        tomorrow_msk_start = today_msk_start + timedelta(days=1)
-        today_utc_start = today_msk_start - timedelta(hours=MOSCOW_OFFSET_HOURS)
-        tomorrow_utc_start = tomorrow_msk_start - timedelta(
-            hours=MOSCOW_OFFSET_HOURS
-        )
-
-        today_trades = df[
-            (df["time"] >= today_utc_start)
-            & (df["time"] < tomorrow_utc_start)
-        ]
-        if today_trades.empty:
-            await query.message.reply_text("📊 Сделок за сегодня (МСК) не было")
+        dates = sorted(df["date"].unique(), reverse=True)
+        if not dates:
+            await query.message.reply_text(
+                "📊 Нет данных для отчёта", reply_markup=with_start_button()
+            )
             return
 
-        buys = today_trades[
-            today_trades["type"].str.contains("BUY", na=False)
-        ]
-        sells = today_trades[
-            today_trades["type"].str.contains("SELL|STOP|TAKE|FORCE", na=False)
-        ]
+        if day is None:
+            btn_rows = []
+            for d in dates[:7]:
+                btn_rows.append(
+                    [InlineKeyboardButton(str(d), callback_data=f"report_day_{d}")]
+                )
+            btn_rows.append([InlineKeyboardButton("⏪ Назад", callback_data="back_to_main")])
+            await query.message.reply_text(
+                "Выбери день для отчёта:",
+                reply_markup=with_start_button(InlineKeyboardMarkup(btn_rows)),
+            )
+            return
 
-        pnl_pct = sells["pnl_pct"].sum() if not sells.empty else 0.0
-        pnl_usd = sells["pnl_usd"].sum() if not sells.empty else 0.0
+        try:
+            selected_date = datetime.fromisoformat(day).date()
+        except Exception:
+            await query.message.reply_text(
+                "❌ Неверный формат даты", reply_markup=with_start_button()
+            )
+            return
 
-        report = (
-            f"📊 <b>Отчёт за сегодня (МСК)</b>\n\n"
-            f"✅ Покупок: {len(buys)}\n"
-            f"📤 Продаж: {len(sells)}\n"
-            f"📈 Общий P&L: <b>{pnl_pct:+.2f}%</b>\n"
-            f"💰 В USDT: <b>${pnl_usd:+.2f}</b>\n\n"
-            f"<b>Детали сделок:</b>\n"
+        day_df = df[df["date"] == selected_date]
+        if day_df.empty:
+            await query.message.reply_text(
+                f"📊 Сделок {selected_date} не найдено",
+                reply_markup=with_start_button(),
+            )
+            return
+
+        lines = [f"📊 <b>Отчёт {selected_date} (МСК)</b>\n"]
+        total_pct = 0.0
+        total_usd = 0.0
+
+        for code, sym in COINS.items():
+            s_df = day_df[day_df["symbol"] == sym]
+            buys = s_df[s_df["type"].str.contains("BUY", na=False)]
+            sells = s_df[s_df["type"].str.contains(SELL_PATTERN, na=False)]
+            pnl_pct = sells["pnl_pct"].sum() if not sells.empty else 0.0
+            pnl_usd = sells["pnl_usd"].sum() if not sells.empty else 0.0
+            total_pct += pnl_pct
+            total_usd += pnl_usd
+            lines.append(
+                f"{code}: BUY {len(buys)} | SELL {len(sells)} | P&L {pnl_pct:+.2f}% | ${pnl_usd:+.2f}"
+            )
+
+        lines.append(f"\nИтого: {total_pct:+.2f}% | ${total_usd:+.2f}")
+
+        keyboard = [
+            [InlineKeyboardButton(str(d), callback_data=f"report_day_{d}")]
+            for d in dates[:7]
+        ]
+        keyboard.append([InlineKeyboardButton("⏪ Назад", callback_data="back_to_main")])
+
+        await query.message.reply_text(
+            "\n".join(lines),
+            parse_mode="HTML",
+            reply_markup=with_start_button(InlineKeyboardMarkup(keyboard)),
         )
-        for _, t in today_trades.iterrows():
-            price = float(t["price"])
-            amount = float(t["amount"])
-            usd_value = float(t.get("usd_value", 0.0))
-            t_type = t["type"]
-
-            if any(x in t_type for x in ["SELL", "STOP", "TAKE", "FORCE"]):
-                pnl_pct_t = float(t.get("pnl_pct", 0.0))
-                pnl_usd_t = float(t.get("pnl_usd", 0.0))
-                sign = "+" if pnl_pct_t > 0 else ""
-                report += (
-                    f"• {t_type:<12} @ {price:>9,.2f} | "
-                    f"{sign}{pnl_pct_t:<6.2f}% | "
-                    f"${pnl_usd_t:+7.2f}\n"
-                )
-            else:
-                report += (
-                    f"• {t_type:<12} @ {price:>9,.2f} | "
-                    f"{amount:<9.6f} | "
-                    f"${usd_value:<7.2f}\n"
-                )
-
-        await query.message.reply_text(report, parse_mode="HTML")
     except Exception as e:
-        await query.message.reply_text(f"❌ Ошибка отчёта: {e}")
+        await query.message.reply_text(
+            f"❌ Ошибка отчёта: {e}", reply_markup=with_start_button()
+        )
 
 
 async def show_pnl_per_symbol(query):
@@ -864,7 +1226,9 @@ async def show_pnl_per_symbol(query):
     )
 
     msg = "\n".join(lines)
-    await query.message.reply_text(msg, parse_mode="HTML")
+    await query.message.reply_text(
+        msg, parse_mode="HTML", reply_markup=with_start_button()
+    )
 
 
 # ================== SETTINGS MENUS ==================
@@ -899,7 +1263,7 @@ async def show_settings_menu(message):
         [InlineKeyboardButton("💰 Настройки депозита", callback_data="settings_deposits")],
         [InlineKeyboardButton("⏪ Назад", callback_data="back_to_main")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = with_start_button(InlineKeyboardMarkup(keyboard))
 
     await message.edit_text(
         text,
@@ -994,7 +1358,7 @@ async def show_trading_settings_menu(message):
         ],
         [InlineKeyboardButton("⏪ Назад", callback_data="settings_back")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = with_start_button(InlineKeyboardMarkup(keyboard))
 
     await message.edit_text(
         text,
@@ -1012,7 +1376,7 @@ async def show_deposit_settings_menu(message):
     deps_text = "\n".join(dep_lines)
 
     text = (
-        f"�� <b>Настройки депозитов</b>\n\n"
+        f"💰 <b>Настройки депозитов</b>\n\n"
         f"<b>Депозит на монету:</b>\n{deps_text}\n\n"
         f"Кнопками можно менять депозит на +/- 1 USDT для каждой пары."
     )
@@ -1036,7 +1400,7 @@ async def show_deposit_settings_menu(message):
         ],
         [InlineKeyboardButton("⏪ Назад", callback_data="settings_back")],
     ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = with_start_button(InlineKeyboardMarkup(keyboard))
 
     await message.edit_text(
         text,
@@ -1195,14 +1559,14 @@ async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     await update.message.reply_text(
         "⚙️ <b>Настройки</b>",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+        reply_markup=with_start_button(InlineKeyboardMarkup(keyboard)),
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
 
 
 # ================== AUTO-TRADING ==================
-async def execute_trade(symbol, signal, price, ex):
+async def execute_trade(symbol, signal, price, ex, cfg):
     global positions, last_trade_time, TRADE_DEPOSITS
 
     pos = positions[symbol]
@@ -1211,8 +1575,8 @@ async def execute_trade(symbol, signal, price, ex):
         balance = ex.fetch_balance()
         usdt = float(balance.get("USDT", {}).get("free", 0))
 
-        amount_usd = TRADE_DEPOSITS.get(symbol, STRATEGY_CONFIG["min_order_usd"])
-        amount_usd = max(amount_usd, STRATEGY_CONFIG["min_order_usd"])
+        amount_usd = TRADE_DEPOSITS.get(symbol, cfg["min_order_usd"])
+        amount_usd = max(amount_usd, cfg["min_order_usd"])
 
         if usdt < amount_usd:
             print(
@@ -1256,8 +1620,8 @@ async def execute_trade(symbol, signal, price, ex):
                     f"{symbol} @ <b>{avg_price:,.4f}</b>\n"
                     f"Объём (USDT): {usd_spent:.2f}\n"
                     f"Объём: {filled:.6f}\n"
-                    f"SL: {avg_price * (1 - STRATEGY_CONFIG['sl_pct']):.4f} | "
-                    f"TP: {avg_price * (1 + STRATEGY_CONFIG['tp_pct']):.4f}"
+                    f"SL: {avg_price * (1 - cfg['sl_pct']):.4f} | "
+                    f"TP: {avg_price * (1 + cfg['tp_pct']):.4f}"
                 )
                 await send_telegram(msg, photo=chart)
                 print(f"[{symbol}] AUTO BUY: {filled:.6f} @ {avg_price:,.4f}")
@@ -1329,6 +1693,7 @@ async def execute_trade(symbol, signal, price, ex):
                         "pnl_usd": pnl_usd,
                     }
                 )
+                adaptive_on_trade(symbol, "AUTO_SELL", pnl_pct)
                 pos["in_position"] = False
                 save_state()
                 msg = (
@@ -1395,7 +1760,7 @@ async def send_all_price_update(current_prices_dict):
 async def detect_manual_trades(ex):
     """
     Проверяем сделки на бирже, находим новые и присылаем сообщение.
-    НЕ трогаем positions и trades.csv — это просто мониторинг.
+    НЕ трогаем positions и таблицу trades — это просто мониторинг.
     """
     global manual_seen_trade_ids
 
@@ -1516,6 +1881,7 @@ async def reconcile_positions(ex):
                     "pnl_usd": pnl_usd,
                 }
             )
+            adaptive_on_trade(symbol, "MANUAL_EXTERNAL_CLOSE", pnl_pct)
 
             pos["in_position"] = False
             save_state()
@@ -1531,8 +1897,9 @@ async def reconcile_positions(ex):
             await send_telegram(msg)
 
 
-def generate_signal(symbol, current, df, ex):
-    cfg = STRATEGY_CONFIG
+def generate_signal(symbol, current, df, ex, cfg=None):
+    if cfg is None:
+        cfg = get_symbol_config(symbol)
     now = time.time()
 
     last = df.iloc[-1]
@@ -1669,10 +2036,11 @@ async def trading_loop():
                     )
                     save_state()
 
-                signal = generate_signal(symbol, current, df, ex)
-                if signal and STRATEGY_CONFIG["auto_enabled"]:
+                cfg = get_symbol_config(symbol)
+                signal = generate_signal(symbol, current, df, ex, cfg)
+                if signal and cfg.get("auto_enabled", True):
                     last_trade_time[symbol] = current_time
-                    await execute_trade(symbol, signal, current_price, ex)
+                    await execute_trade(symbol, signal, current_price, ex, cfg)
 
             # Детектор ручных (биржевых) сделок
             await detect_manual_trades(ex)
@@ -1735,7 +2103,7 @@ async def show_positions_menu(message):
     )
     keyboard.append([InlineKeyboardButton("⏪ Назад", callback_data="back_to_main")])
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = with_start_button(InlineKeyboardMarkup(keyboard))
 
     await message.edit_text(
         text,
@@ -1753,7 +2121,10 @@ async def close_single_position(query, coin_code: str):
 
     pos = positions[symbol]
     if not pos["in_position"]:
-        await query.message.reply_text(f"❌ По {coin_code} нет открытой позиции")
+        await query.message.reply_text(
+            f"❌ По {coin_code} нет открытой позиции",
+            reply_markup=with_start_button(),
+        )
         return
 
     try:
@@ -1780,6 +2151,7 @@ async def close_single_position(query, coin_code: str):
                     "pnl_usd": pnl_usd,
                 }
             )
+            adaptive_on_trade(symbol, "MANUAL_SELL", pnl_pct)
             pos["in_position"] = False
             save_state()
 
@@ -1789,11 +2161,19 @@ async def close_single_position(query, coin_code: str):
                 f"Объём (USDT): {usd_received:.2f}\n"
                 f"P&L: <b>{pnl_pct:+.2f}%</b> | <b>${pnl_usd:+.2f}</b>"
             )
-            await query.message.reply_text(msg, parse_mode="HTML")
+            await query.message.reply_text(
+                msg, parse_mode="HTML", reply_markup=with_start_button()
+            )
         else:
-            await query.message.reply_text(f"❌ Не удалось закрыть позицию по {symbol}")
+            await query.message.reply_text(
+                f"❌ Не удалось закрыть позицию по {symbol}",
+                reply_markup=with_start_button(),
+            )
     except Exception as e:
-        await query.message.reply_text(f"❌ Ошибка закрытия {symbol}: {e}")
+        await query.message.reply_text(
+            f"❌ Ошибка закрытия {symbol}: {e}",
+            reply_markup=with_start_button(),
+        )
 
 
 async def close_all_positions(query):
@@ -1804,7 +2184,10 @@ async def close_all_positions(query):
             any_closed = True
 
     if not any_closed:
-        await query.message.reply_text("Нет открытых позиций по всем монетам.")
+        await query.message.reply_text(
+            "Нет открытых позиций по всем монетам.",
+            reply_markup=with_start_button(),
+        )
 
 
 # ================== BUTTON HANDLER ==================
@@ -1818,6 +2201,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "report":
         await handle_report(query)
+    elif data == "risk_soft":
+        set_soft_start_mode()
+        await query.message.reply_text(
+            "Режим входа: <b>МЯГКИЙ</b>\n"
+            f"Первые {MIN_TRADES_BEFORE_AUTO} сделок по монете будут мягче, затем автоадаптация.",
+            parse_mode="HTML",
+            reply_markup=with_start_button(),
+        )
+    elif data == "risk_hard":
+        set_hard_start_mode()
+        await query.message.reply_text(
+            "Режим входа: <b>ЖЁСТКИЙ</b>\n"
+            f"Первые {MIN_TRADES_BEFORE_AUTO} сделок по монете будут осторожнее, затем автоадаптация.",
+            parse_mode="HTML",
+            reply_markup=with_start_button(),
+        )
+    elif data.startswith("report_day_"):
+        await handle_report(query, data.split("report_day_", 1)[1])
     elif data == "pnl":
         await show_pnl_per_symbol(query)
     elif data == "market":
@@ -1855,7 +2256,11 @@ async def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    check_env()
+    init_db()
+    migrate_csv_to_db()
     load_state()
+    init_adaptive_state()
     await send_telegram("✅ <b>Торговый бот запущен!</b>\n/start для управления")
     print("Стартовое сообщение отправлено")
 
@@ -1883,44 +2288,7 @@ async def main():
 
 
 if __name__ == "__main__":
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
     try:
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         print("Завершение по запросу пользователя")
-    finally:
-        loop.close()
-
-"""
-Сюда ниже ты вставишь свой код бота (тот большой файл, который у тебя уже есть):
-- вся логика с ccxt
-- Telegram-бот (Application, handlers)
-- торговый цикл, и т.д.
-
-Что нужно будет сделать:
-1) В твоём старом коде функция log_trade(...) писала в CSV.
-   Ты можешь:
-   - либо оставить её как есть (CSV),
-   - либо заменить/дополнить вызовом log_trade_sql(...) выше, чтобы писать в SQLite.
-
-2) Точка входа (if __name__ == "__main__": ...) у тебя уже есть в старом файле.
-   Просто перенеси её сюда, в этот файл.
-"""
-
-
-def main():
-    """
-    Временная заглушка.
-    Пока мы не вставили сюда твой текущий код бота,
-    просто проверим .env и инициализируем базу.
-    """
-    check_env()
-    init_db()
-    print("OK: .env в порядке, база botinfo.db инициализирована.")
-    print("Теперь можно вставлять сюда код бота и запускать его.")
-
-
-if __name__ == "__main__":
-    main()

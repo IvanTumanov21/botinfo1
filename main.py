@@ -1,7 +1,8 @@
 import os
 import sqlite3
+import psutil
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from collections import deque
 from dotenv import load_dotenv
@@ -193,7 +194,7 @@ def log_trade_sql(
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
 
-    time_utc = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S")
+    time_utc = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
     cur.execute(
         """
@@ -620,7 +621,7 @@ def log_trade(trade_data):
             float(trade_data.get("usd_value", 0.0)),
             float(trade_data.get("pnl_pct", 0.0)),
             float(trade_data.get("pnl_usd", 0.0)),
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
         ),
     )
 
@@ -722,7 +723,7 @@ def get_pnl_today():
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
         df = df.dropna(subset=["time"])
 
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         now_msk = now_utc + timedelta(hours=MOSCOW_OFFSET_HOURS)
 
         today_msk_start = now_msk.replace(
@@ -769,7 +770,7 @@ def get_pnl_today_per_symbol():
         df["time"] = pd.to_datetime(df["time"], errors="coerce")
         df = df.dropna(subset=["time"])
 
-        now_utc = datetime.utcnow()
+        now_utc = datetime.now(timezone.utc)
         now_msk = now_utc + timedelta(hours=MOSCOW_OFFSET_HOURS)
 
         today_msk_start = now_msk.replace(
@@ -805,6 +806,89 @@ def get_pnl_today_per_symbol():
     except Exception as e:
         print(f"P&L per symbol Error: {e}")
         return {}, 0.0, 0.0
+
+
+# ================== СТАТИСТИКА ЭФФЕКТИВНОСТИ ==================
+
+def get_trading_statistics():
+    """
+    Рассчитывает статистику эффективности торговли:
+    - Winrate (% прибыльных сделок)
+    - Average P&L per trade
+    - Max Drawdown
+    - Sharpe Ratio (упрощенный)
+    """
+    df = load_trades_dataframe()
+    if df.empty:
+        return None
+    
+    try:
+        # Фильтруем только SELL сделки (они имеют P&L)
+        sells = df[df["type"].str.contains(SELL_PATTERN, na=False)].copy()
+        
+        if sells.empty or len(sells) < 2:
+            return None
+        
+        # Winrate - процент прибыльных сделок
+        profitable_trades = len(sells[sells["pnl_usd"] > 0])
+        total_trades = len(sells)
+        winrate = (profitable_trades / total_trades * 100) if total_trades > 0 else 0.0
+        
+        # Average P&L per trade
+        avg_pnl_usd = sells["pnl_usd"].mean()
+        avg_pnl_pct = sells["pnl_pct"].mean()
+        
+        # Max Drawdown - максимальная просадка от пика
+        sells["cumulative_pnl"] = sells["pnl_usd"].cumsum()
+        running_max = sells["cumulative_pnl"].expanding().max()
+        drawdown = sells["cumulative_pnl"] - running_max
+        max_drawdown = abs(drawdown.min())
+        
+        # Sharpe Ratio (упрощенный) - отношение средней доходности к волатильности
+        returns_std = sells["pnl_pct"].std()
+        sharpe_ratio = (avg_pnl_pct / returns_std) if returns_std > 0 else 0.0
+        
+        # Максимальная прибыль и убыток
+        max_profit = sells["pnl_usd"].max()
+        max_loss = sells["pnl_usd"].min()
+        
+        # Общий P&L
+        total_pnl_usd = sells["pnl_usd"].sum()
+        
+        return {
+            "total_trades": total_trades,
+            "winrate": winrate,
+            "profitable_trades": profitable_trades,
+            "losing_trades": total_trades - profitable_trades,
+            "avg_pnl_usd": avg_pnl_usd,
+            "avg_pnl_pct": avg_pnl_pct,
+            "max_drawdown": max_drawdown,
+            "sharpe_ratio": sharpe_ratio,
+            "max_profit": max_profit,
+            "max_loss": max_loss,
+            "total_pnl_usd": total_pnl_usd,
+        }
+    
+    except Exception as e:
+        print(f"Statistics Error: {e}")
+        return None
+
+
+def log_memory_usage():
+    """Логирует текущее использование памяти процесса"""
+    try:
+        process = psutil.Process()
+        mem_info = process.memory_info()
+        mem_mb = mem_info.rss / 1024 / 1024  # в мегабайтах
+        
+        # Логируем только если памяти много
+        if mem_mb > 200:
+            print(f"⚠️ Память: {mem_mb:.1f} MB")
+        
+        return mem_mb
+    except Exception as e:
+        print(f"Memory monitoring error: {e}")
+        return 0.0
 
 
 def plot_mini_chart(symbol, ohlcv):
@@ -997,9 +1081,10 @@ def build_main_keyboard():
             ],
             [
                 InlineKeyboardButton("📊 Рынок", callback_data="market"),
-                InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
+                InlineKeyboardButton("📈 Статистика", callback_data="statistics"),
             ],
             [
+                InlineKeyboardButton("⚙️ Настройки", callback_data="settings"),
                 InlineKeyboardButton("🚪 Выход из сделок", callback_data="positions_menu"),
             ],
             [
@@ -1099,12 +1184,17 @@ async def start_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"В USDT: ${pnl_usd:+.2f}"
     )
 
-    await query.edit_message_text(
-        text,
-        reply_markup=with_start_button(build_main_keyboard()),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
+    try:
+        await query.edit_message_text(
+            text,
+            reply_markup=with_start_button(build_main_keyboard()),
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        # Игнорируем ошибку "Message is not modified"
+        if "message is not modified" not in str(e).lower():
+            print(f"Edit message error: {e}")
 
 
 # ================== REPORT / PNL BUTTONS ==================
@@ -1226,6 +1316,44 @@ async def show_pnl_per_symbol(query):
     )
 
     msg = "\n".join(lines)
+    await query.message.reply_text(
+        msg, parse_mode="HTML", reply_markup=with_start_button()
+    )
+
+
+async def show_statistics(query):
+    """Показывает статистику эффективности торговли"""
+    stats = get_trading_statistics()
+    
+    if stats is None:
+        await query.message.reply_text(
+            "📊 <b>Статистика</b>\n\n"
+            "Недостаточно данных для расчёта статистики.\n"
+            "Минимум 2 завершённых сделки необходимо.",
+            parse_mode="HTML",
+            reply_markup=with_start_button(),
+        )
+        return
+    
+    msg = (
+        f"📈 <b>Статистика эффективности</b>\n\n"
+        f"<b>Общие показатели:</b>\n"
+        f"Всего сделок: {stats['total_trades']}\n"
+        f"Прибыльных: {stats['profitable_trades']} ✅\n"
+        f"Убыточных: {stats['losing_trades']} ❌\n"
+        f"Winrate: <b>{stats['winrate']:.1f}%</b>\n\n"
+        f"<b>Прибыльность:</b>\n"
+        f"Средняя сделка: {stats['avg_pnl_pct']:+.2f}% | ${stats['avg_pnl_usd']:+.2f}\n"
+        f"Общий P&L: <b>${stats['total_pnl_usd']:+.2f}</b>\n\n"
+        f"<b>Риски:</b>\n"
+        f"Макс. прибыль: ${stats['max_profit']:+.2f} 🟢\n"
+        f"Макс. убыток: ${stats['max_loss']:+.2f} 🔴\n"
+        f"Макс. просадка: ${stats['max_drawdown']:.2f}\n\n"
+        f"<b>Эффективность:</b>\n"
+        f"Sharpe Ratio: {stats['sharpe_ratio']:.2f}\n"
+        f"<i>(>1.0 = хорошо, >2.0 = отлично)</i>"
+    )
+    
     await query.message.reply_text(
         msg, parse_mode="HTML", reply_markup=with_start_button()
     )
@@ -1599,7 +1727,7 @@ async def execute_trade(symbol, signal, price, ex, cfg):
                         "in_position": True,
                         "entry_price": avg_price,
                         "amount": filled,
-                        "buy_time": datetime.utcnow().isoformat(),
+                        "buy_time": datetime.now(timezone.utc).isoformat(),
                     }
                 )
                 save_state()
@@ -2013,7 +2141,7 @@ async def trading_loop():
     while running:
         try:
             ex = get_exchange()
-            now_utc = datetime.utcnow()
+            now_utc = datetime.now(timezone.utc)
             now_msk = now_utc + timedelta(hours=MOSCOW_OFFSET_HOURS)
             today_msk_str = now_msk.strftime("%Y-%m-%d")
             current_time = time.time()
@@ -2052,6 +2180,10 @@ async def trading_loop():
                 if current_time - last_price_update_time > STRATEGY_CONFIG["price_update_interval_sec"]:
                     await send_all_price_update(current_prices)
                     last_price_update_time = current_time
+
+            # Мониторинг памяти каждые 5 минут
+            if int(current_time) % 300 == 0:
+                log_memory_usage()
 
             await asyncio.sleep(60)
 
@@ -2221,6 +2353,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_report(query, data.split("report_day_", 1)[1])
     elif data == "pnl":
         await show_pnl_per_symbol(query)
+    elif data == "statistics":
+        await show_statistics(query)
     elif data == "market":
         await cmd_market(update, context)
     elif data == "settings":

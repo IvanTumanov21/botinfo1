@@ -3,3 +3,4 @@ ccxt
 python-dotenv
 pandas
 matplotlib
+psutil

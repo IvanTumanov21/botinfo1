@@ -242,6 +242,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "history":
         await handle_history(query)
     
+    # Сканирование вкл/выкл
+    elif data == "scan_toggle":
+        await handle_scan_toggle(query)
+    
+    # Принудительный скан
+    elif data == "force_scan":
+        await handle_force_scan(query)
+    
     # Назад в главное меню
     elif data == "back_to_main":
         await handle_back_to_main(query)
@@ -421,7 +429,13 @@ async def handle_status(query):
 • P&L: ${stats.total_pnl_usdt if stats else 0:+.2f}
 """
     
-    await query.edit_message_text(text, parse_mode="HTML")
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
+    
+    await query.edit_message_text(
+        text, 
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
 
 
 async def handle_balance(query):
@@ -540,6 +554,41 @@ async def handle_history(query):
     )
 
 
+async def handle_scan_toggle(query):
+    """Меню сканирования"""
+    keyboard = [
+        [InlineKeyboardButton("🔍 Сканировать сейчас", callback_data="force_scan")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
+    ]
+    
+    text = """
+⚙️ <b>Сканирование</b>
+
+• Автоскан каждые 60 сек
+• Проверка позиций каждые 30 сек
+
+Нажми "Сканировать сейчас" для принудительного поиска сигналов.
+"""
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_force_scan(query):
+    """Принудительный запуск сканирования"""
+    await query.edit_message_text(
+        "🔍 <b>Сканирую рынок...</b>\n\nЭто может занять 1-2 минуты.",
+        parse_mode="HTML"
+    )
+    
+    # Отправляем уведомление о начале
+    if telegram_bot:
+        await telegram_bot.send_message("🔍 Запущен принудительный скан рынка...")
+
+
 async def handle_back_to_main(query):
     """Возврат в главное меню"""
     keyboard = [
@@ -550,6 +599,9 @@ async def handle_back_to_main(query):
         [
             InlineKeyboardButton("📈 Позиции", callback_data="positions"),
             InlineKeyboardButton("📋 История", callback_data="history"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Сканирование", callback_data="scan_toggle"),
         ],
     ]
     

@@ -146,10 +146,17 @@ async def main():
     setup_handlers(app)
     set_components(exchange, telegram_bot)
     
-    # 6. Запуск Telegram polling
+    # 6. Инициализация Telegram
     await app.initialize()
     await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
+    
+    # Запускаем polling как отдельный таск
+    polling_task = asyncio.create_task(
+        app.updater.start_polling(drop_pending_updates=True)
+    )
+    
+    # Даём время на запуск polling
+    await asyncio.sleep(1)
     
     # 7. Отправляем стартовое сообщение
     await telegram_bot.send_message(
@@ -165,11 +172,12 @@ async def main():
     logger.info("🔄 Запуск фоновых тасков...")
     scan_task = asyncio.create_task(scan_loop())
     position_task = asyncio.create_task(position_loop())
-    logger.info("✅ Таски созданы")
+    logger.info("✅ Таски созданы, ожидаем сигнала завершения...")
     
-    # 9. Ждём завершения
+    # 9. Ждём завершения (SIGTERM/SIGINT)
     try:
-        await asyncio.gather(scan_task, position_task, return_exceptions=True)
+        while running:
+            await asyncio.sleep(1)
     except asyncio.CancelledError:
         pass
     

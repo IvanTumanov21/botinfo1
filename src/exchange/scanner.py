@@ -44,18 +44,23 @@ class MarketScanner:
         Проверяет глобальные условия рынка.
         Возвращает словарь с причинами, почему нельзя торговать.
         """
+        logger.debug("🔍 Проверка условий рынка...")
         conditions = {
             "can_trade": True,
             "reasons": []
         }
         
         # 1. Проверка падения BTC
-        btc_change = await self.exchange.get_btc_change_1h()
-        if btc_change < ANTI_FOMO["btc_drop_threshold"]:
-            conditions["can_trade"] = False
-            conditions["reasons"].append(
-                f"BTC падает ({btc_change*100:.2f}% за 1ч)"
-            )
+        try:
+            btc_change = await self.exchange.get_btc_change_1h()
+            logger.debug(f"BTC 1h change: {btc_change*100:.2f}%")
+            if btc_change < ANTI_FOMO["btc_drop_threshold"]:
+                conditions["can_trade"] = False
+                conditions["reasons"].append(
+                    f"BTC падает ({btc_change*100:.2f}% за 1ч)"
+                )
+        except Exception as e:
+            logger.error(f"Ошибка проверки BTC: {e}")
         
         # 2. Проверка ночных часов UTC
         now_utc = datetime.now(timezone.utc)
@@ -234,11 +239,15 @@ class MarketScanner:
         if self.should_update_universe():
             await self.update_universe()
         
+        logger.info("🔍 Проверка рыночных условий...")
+        
         # Проверяем глобальные условия
         market = await self.check_market_conditions()
         if not market["can_trade"]:
             logger.info(f"⏸ Торговля приостановлена: {', '.join(market['reasons'])}")
             return []
+        
+        logger.info("✅ Условия ОК, начинаем сканирование...")
         
         if not self.symbols:
             logger.warning("Нет пар для сканирования")

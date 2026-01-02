@@ -245,20 +245,30 @@ TELEGRAM_CHAT_ID = int(chat_id_env)
 STRATEGY_CONFIG = {
     "ema_fast": 9,
     "ema_slow": 21,
-    "rsi_min": 50,
-    "rsi_max": 70,
-    "volume_mult": 1.5,
-    "price_growth_min": 0.0005,
-    "sl_pct": 0.02,
-    "tp_pct": 0.04,
-    "min_interval_sec": 300,
+    "rsi_min": 40,           # Расширили диапазон RSI
+    "rsi_max": 65,           # Не покупаем перекупленные активы
+    "volume_mult": 1.2,      # Снизили требование к объёму
+    "price_growth_min": 0.001,  # Более явный рост
+    "sl_pct": 0.015,         # Тighter SL - 1.5%
+    "tp_pct": 0.045,         # TP 4.5% - соотношение 1:3
+    "min_interval_sec": 600, # 10 минут между сделками - меньше шума
     "auto_enabled": True,
     "notifications_enabled": True,
-    "atr_threshold_pct": 0.01,
+    "atr_threshold_pct": 0.015,   # Фильтруем сверх-волатильность
     "fib_buy_level": 0.382,
     "fib_sell_level": 0.618,
     "min_order_usd": 5,
-    "price_update_interval_sec": 300,  # интервал уведомлений о ценах (сек)
+    "price_update_interval_sec": 300,
+    # === НОВЫЕ ПАРАМЕТРЫ ===
+    "trailing_stop_enabled": True,   # Trailing Stop Loss
+    "trailing_stop_pct": 0.012,      # Trailing на 1.2% от максимума
+    "btc_trend_filter": True,        # Торгуем только по тренду BTC
+    "min_daily_volume_usd": 1000000, # Минимальный дневной объём
+    "max_positions": 2,              # Максимум 2 позиции одновременно
+    "trading_hours_only": True,      # Торговать только в активные часы
+    "active_hours_start": 9,         # Начало (МСК)
+    "active_hours_end": 23,          # Конец (МСК)
+    "require_higher_tf_confirm": True,  # Подтверждение на старшем ТФ
 }
 
 MOSCOW_OFFSET_HOURS = 3
@@ -442,7 +452,14 @@ def get_symbol_config(symbol: str) -> dict:
 
 # ================== STATE ==================
 positions = {
-    sym: {"in_position": False, "entry_price": 0.0, "amount": 0.0, "buy_time": None}
+    sym: {
+        "in_position": False, 
+        "entry_price": 0.0, 
+        "amount": 0.0, 
+        "buy_time": None,
+        "max_price": 0.0,      # Для trailing stop
+        "trailing_stop": 0.0,  # Уровень trailing stop
+    }
     for sym in SYMBOLS
 }
 
@@ -531,7 +548,15 @@ def load_state():
                 saved_positions = state.get("positions", {})
                 for sym in SYMBOLS:
                     if sym in saved_positions:
-                        positions[sym] = saved_positions[sym]
+                        pos_data = saved_positions[sym]
+                        positions[sym] = {
+                            "in_position": pos_data.get("in_position", False),
+                            "entry_price": pos_data.get("entry_price", 0.0),
+                            "amount": pos_data.get("amount", 0.0),
+                            "buy_time": pos_data.get("buy_time"),
+                            "max_price": pos_data.get("max_price", pos_data.get("entry_price", 0.0)),
+                            "trailing_stop": pos_data.get("trailing_stop", 0.0),
+                        }
 
                 saved_last_price = state.get("last_price", {})
                 if isinstance(saved_last_price, dict):
@@ -666,6 +691,122 @@ def calculate_atr(df, period=14):
     return 0
 
 
+def is_trading_hours_active(cfg) -> bool:
+    """Проверяет, находимся ли мы в активных торговых часах (МСК)"""
+    if not cfg.get("trading_hours_only", False):
+        return True
+    
+    now_utc = datetime.now(timezone.utc)
+    now_msk = now_utc + timedelta(hours=MOSCOW_OFFSET_HOURS)
+    current_hour = now_msk.hour
+    
+    start = cfg.get("active_hours_start", 9)
+    end = cfg.get("active_hours_end", 23)
+    
+    return start <= current_hour < end
+
+
+def get_btc_trend(ex) -> str:
+    """
+    Определяет тренд BTC на 15-минутном ТФ.
+    Возвращает: 'UP', 'DOWN', 'SIDEWAYS'
+    """
+    try:
+        ohlcv = ex.fetch_ohlcv("BTC/USDT", "15m", limit=50)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["close"] = df["close"].astype(float)
+        
+        # EMA 20 и 50 на 15м
+        df["ema20"] = df["close"].ewm(span=20, adjust=False).mean()
+        df["ema50"] = df["close"].ewm(span=50, adjust=False).mean()
+        
+        last = df.iloc[-1]
+        prev = df.iloc[-3]  # 3 свечи назад
+        
+        # Тренд UP если EMA20 > EMA50 и цена растёт
+        if last["ema20"] > last["ema50"] and last["close"] > prev["close"]:
+            return "UP"
+        # Тренд DOWN если EMA20 < EMA50 и цена падает
+        elif last["ema20"] < last["ema50"] and last["close"] < prev["close"]:
+            return "DOWN"
+        else:
+            return "SIDEWAYS"
+    except Exception as e:
+        print(f"BTC trend check error: {e}")
+        return "SIDEWAYS"
+
+
+def get_higher_timeframe_confirmation(symbol, ex) -> bool:
+    """
+    Проверяет подтверждение тренда на 15-минутном ТФ.
+    Возвращает True если тренд бычий.
+    """
+    try:
+        ohlcv = ex.fetch_ohlcv(symbol, "15m", limit=30)
+        df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["close"] = df["close"].astype(float)
+        
+        df["ema9"] = df["close"].ewm(span=9, adjust=False).mean()
+        df["ema21"] = df["close"].ewm(span=21, adjust=False).mean()
+        
+        last = df.iloc[-1]
+        
+        # Бычий тренд на старшем ТФ
+        return last["ema9"] > last["ema21"] and last["close"] > last["ema9"]
+    except Exception as e:
+        print(f"Higher TF check error ({symbol}): {e}")
+        return False
+
+
+def count_open_positions() -> int:
+    """Считает количество открытых позиций"""
+    return sum(1 for sym in SYMBOLS if positions[sym]["in_position"])
+
+
+def update_trailing_stop(symbol, current_price, cfg):
+    """Обновляет trailing stop если цена выросла"""
+    pos = positions[symbol]
+    if not pos["in_position"]:
+        return
+    
+    if not cfg.get("trailing_stop_enabled", False):
+        return
+    
+    # Инициализируем max_price если нужно
+    if pos.get("max_price", 0) < pos["entry_price"]:
+        pos["max_price"] = pos["entry_price"]
+    
+    # Обновляем максимум если цена выросла
+    if current_price > pos["max_price"]:
+        pos["max_price"] = current_price
+        # Trailing stop = max_price * (1 - trailing_pct)
+        pos["trailing_stop"] = pos["max_price"] * (1 - cfg.get("trailing_stop_pct", 0.012))
+        save_state()
+
+
+def check_trailing_stop_hit(symbol, current_price, cfg) -> bool:
+    """Проверяет сработал ли trailing stop"""
+    pos = positions[symbol]
+    if not pos["in_position"]:
+        return False
+    
+    if not cfg.get("trailing_stop_enabled", False):
+        return False
+    
+    trailing_stop = pos.get("trailing_stop", 0)
+    if trailing_stop <= 0:
+        return False
+    
+    # Trailing stop срабатывает только если мы уже в плюсе
+    # (цена была выше точки входа + минимальная прибыль)
+    min_profit_for_trailing = pos["entry_price"] * 1.01  # минимум 1% прибыли
+    
+    if pos["max_price"] > min_profit_for_trailing and current_price <= trailing_stop:
+        return True
+    
+    return False
+
+
 def get_market_context(symbol, current_close, cfg, ex):
     try:
         ohlcv_24h = ex.fetch_ohlcv(symbol, "1m", limit=1440)
@@ -675,15 +816,33 @@ def get_market_context(symbol, current_close, cfg, ex):
         df_24h["high"] = df_24h["high"].astype(float)
         df_24h["low"] = df_24h["low"].astype(float)
         df_24h["close"] = df_24h["close"].astype(float)
+        df_24h["volume"] = df_24h["volume"].astype(float)
 
         resistance = df_24h["high"].max()
         support = df_24h["low"].min()
         atr_14 = calculate_atr(df_24h, 14)
+        
+        # Проверка дневного объёма
+        daily_volume_usd = (df_24h["close"] * df_24h["volume"]).sum()
+        min_volume = cfg.get("min_daily_volume_usd", 1000000)
+        
+        if daily_volume_usd < min_volume:
+            print(f"[{symbol}] Low volume: ${daily_volume_usd:,.0f} < ${min_volume:,.0f}")
+            return {
+                "trade_allowed": False,
+                "reason": "low_volume",
+                "support": support,
+                "resistance": resistance,
+                "fib_382": None,
+                "fib_618": None,
+                "atr_14": atr_14,
+            }
 
         if atr_14 > current_close * cfg["atr_threshold_pct"]:
             print(f"[{symbol}] ATR too high: {atr_14:.2f}")
             return {
                 "trade_allowed": False,
+                "reason": "high_atr",
                 "support": support,
                 "resistance": resistance,
                 "fib_382": None,
@@ -1728,6 +1887,8 @@ async def execute_trade(symbol, signal, price, ex, cfg):
                         "entry_price": avg_price,
                         "amount": filled,
                         "buy_time": datetime.now(timezone.utc).isoformat(),
+                        "max_price": avg_price,      # Инициализируем для trailing stop
+                        "trailing_stop": 0.0,        # Начальное значение
                     }
                 )
                 save_state()
@@ -1743,13 +1904,22 @@ async def execute_trade(symbol, signal, price, ex, cfg):
                     }
                 )
                 chart = plot_mini_chart(symbol, ex.fetch_ohlcv(symbol, "1m", limit=50))
+                
+                # Рассчитываем уровни для сообщения
+                sl_level = avg_price * (1 - cfg['sl_pct'])
+                tp_level = avg_price * (1 + cfg['tp_pct'])
+                trailing_info = ""
+                if cfg.get("trailing_stop_enabled", False):
+                    trailing_info = f"\n📊 Trailing Stop: активен (от +1%)"
+                
                 msg = (
                     f"✅ <b>АВТО-ПОКУПКА</b>\n"
                     f"{symbol} @ <b>{avg_price:,.4f}</b>\n"
                     f"Объём (USDT): {usd_spent:.2f}\n"
                     f"Объём: {filled:.6f}\n"
-                    f"SL: {avg_price * (1 - cfg['sl_pct']):.4f} | "
-                    f"TP: {avg_price * (1 + cfg['tp_pct']):.4f}"
+                    f"🔻 SL: {sl_level:.4f} (-{cfg['sl_pct']*100:.1f}%)\n"
+                    f"🎯 TP: {tp_level:.4f} (+{cfg['tp_pct']*100:.1f}%)"
+                    f"{trailing_info}"
                 )
                 await send_telegram(msg, photo=chart)
                 print(f"[{symbol}] AUTO BUY: {filled:.6f} @ {avg_price:,.4f}")
@@ -2026,49 +2196,113 @@ async def reconcile_positions(ex):
 
 
 def generate_signal(symbol, current, df, ex, cfg=None):
+    """
+    УЛУЧШЕННАЯ функция генерации сигналов с фильтрами:
+    - Фильтр тренда BTC
+    - Подтверждение на старшем ТФ
+    - Ограничение кол-ва позиций
+    - Торговые часы
+    - Trailing Stop Loss
+    """
     if cfg is None:
         cfg = get_symbol_config(symbol)
     now = time.time()
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
+    current_price = last["close"]
 
+    # Минимальный интервал между сделками
     if now - last_trade_time[symbol] < cfg["min_interval_sec"]:
         return None
 
     pos = positions[symbol]
 
+    # === ОБНОВЛЯЕМ TRAILING STOP ===
+    if pos["in_position"]:
+        update_trailing_stop(symbol, current_price, cfg)
+
+    # === ПРОВЕРКИ ДЛЯ ПОКУПКИ ===
+    
+    # 1. Проверка торговых часов
+    if not is_trading_hours_active(cfg):
+        if not pos["in_position"]:
+            return None  # Не покупаем вне торговых часов
+    
+    # 2. Проверка лимита позиций
+    if not pos["in_position"] and count_open_positions() >= cfg.get("max_positions", 2):
+        return None  # Достигнут лимит позиций
+
+    # 3. Фильтр тренда BTC (для альткоинов)
+    if cfg.get("btc_trend_filter", True) and symbol != "BTC/USDT" and not pos["in_position"]:
+        btc_trend = get_btc_trend(ex)
+        if btc_trend != "UP":
+            # Не покупаем альткоины если BTC не в восходящем тренде
+            return None
+
+    # === УРОВНИ SL/TP ===
     sl_price = pos["entry_price"] * (1 - cfg["sl_pct"]) if pos["in_position"] else None
     tp_price = pos["entry_price"] * (1 + cfg["tp_pct"]) if pos["in_position"] else None
+    trailing_stop = pos.get("trailing_stop", 0) if pos["in_position"] else None
 
-    basic_buy = (
+    # === УСЛОВИЯ ПОКУПКИ (УЛУЧШЕННЫЕ) ===
+    basic_buy_conditions = (
         (not pos["in_position"])
-        and last["close"] > last["ema9"] > last["ema21"]
-        and cfg["rsi_min"] < last["rsi"] < cfg["rsi_max"]
-        and last["volume"] > last["avg_volume"] * cfg["volume_mult"]
-        and last["close"] > prev["close"] * (1 + cfg["price_growth_min"])
+        and last["close"] > last["ema9"] > last["ema21"]  # Тренд вверх
+        and cfg["rsi_min"] < last["rsi"] < cfg["rsi_max"]  # RSI в зоне
+        and last["volume"] > last["avg_volume"] * cfg["volume_mult"]  # Объём выше среднего
+        and last["close"] > prev["close"] * (1 + cfg["price_growth_min"])  # Рост цены
+        and last["close"] > last["open"]  # Зелёная свеча
     )
+    
+    # Дополнительная проверка: подтверждение на старшем ТФ
+    higher_tf_ok = True
+    if cfg.get("require_higher_tf_confirm", True) and basic_buy_conditions:
+        higher_tf_ok = get_higher_timeframe_confirmation(symbol, ex)
 
+    basic_buy = basic_buy_conditions and higher_tf_ok
+
+    # === УСЛОВИЯ ПРОДАЖИ (УЛУЧШЕННЫЕ) ===
+    
+    # Проверка trailing stop
+    trailing_stop_hit = check_trailing_stop_hit(symbol, current_price, cfg)
+    
     basic_sell = (
         pos["in_position"]
         and cfg["auto_enabled"]
         and (
-            (sl_price is not None and last["close"] <= sl_price)
-            or (tp_price is not None and last["close"] >= tp_price)
-            or last["rsi"] > 75
-            or last["close"] < last["ema9"] * 0.999
+            # Стоп-лосс
+            (sl_price is not None and current_price <= sl_price)
+            # Тейк-профит
+            or (tp_price is not None and current_price >= tp_price)
+            # Trailing Stop (если активен и сработал)
+            or trailing_stop_hit
+            # RSI перекупленность (но только если уже в плюсе)
+            or (last["rsi"] > 78 and current_price > pos["entry_price"])
+            # Разворот тренда (цена сильно ниже EMA9)
+            or current_price < last["ema9"] * 0.995
         )
     )
 
-    market_ctx = get_market_context(symbol, last["close"], cfg, ex)
+    # === РЫНОЧНЫЙ КОНТЕКСТ ===
+    market_ctx = get_market_context(symbol, current_price, cfg, ex)
+    
     if market_ctx is None:
         if basic_buy:
+            print(f"[{symbol}] BUY signal (basic, no market ctx)")
             return "BUY"
         if basic_sell:
+            sell_reason = "SL" if (sl_price and current_price <= sl_price) else \
+                          "TP" if (tp_price and current_price >= tp_price) else \
+                          "TRAILING" if trailing_stop_hit else "OTHER"
+            print(f"[{symbol}] SELL signal ({sell_reason})")
             return "SELL"
         return None
 
     if not market_ctx["trade_allowed"]:
+        # Даже если торговля запрещена - продаём если нужно
+        if basic_sell:
+            return "SELL"
         return None
 
     support = market_ctx["support"]
@@ -2077,45 +2311,53 @@ def generate_signal(symbol, current, df, ex, cfg=None):
     fib_618 = market_ctx["fib_618"]
     atr_14 = market_ctx["atr_14"]
 
+    # Покупка около поддержки (осторожнее)
     level_buy = (
         not pos["in_position"]
-        and support * 0.999 <= last["close"] <= support * 1.001
-        and last["rsi"] > 40
+        and support * 0.998 <= current_price <= support * 1.002
+        and last["rsi"] > 35
+        and last["rsi"] < 55  # Не перекупленный
+        and higher_tf_ok
     )
 
+    # Продажа около сопротивления
     level_sell = (
         pos["in_position"]
-        and resistance * 0.999 <= last["close"] <= resistance * 1.001
-        and last["rsi"] > 60
+        and resistance * 0.998 <= current_price <= resistance * 1.002
+        and current_price > pos["entry_price"]  # Только в плюсе
     )
 
+    # Фибоначчи уровни
     fib_buy = (
         not pos["in_position"]
         and fib_382 is not None
         and atr_14 > 0
-        and abs(last["close"] - fib_382) < atr_14
+        and abs(current_price - fib_382) < atr_14 * 0.5  # Ужесточили
         and last["close"] > last["open"]
+        and higher_tf_ok
     )
 
     fib_sell = (
         pos["in_position"]
         and fib_618 is not None
         and atr_14 > 0
-        and abs(last["close"] - fib_618) < atr_14
-        and last["close"] < last["open"]
+        and abs(current_price - fib_618) < atr_14 * 0.5
+        and current_price > pos["entry_price"]
     )
 
-    if level_buy or fib_buy:
-        return "BUY"
-
-    if level_sell or fib_sell:
+    # === ФИНАЛЬНОЕ РЕШЕНИЕ ===
+    
+    # Приоритет продажи (защита капитала)
+    if basic_sell or level_sell or fib_sell:
+        reason = "basic" if basic_sell else "level" if level_sell else "fib"
+        print(f"[{symbol}] SELL signal ({reason})")
         return "SELL"
 
-    if basic_buy:
+    # Покупка только при всех подтверждениях
+    if level_buy or fib_buy or basic_buy:
+        reason = "level" if level_buy else "fib" if fib_buy else "basic"
+        print(f"[{symbol}] BUY signal ({reason}), HTF confirm: {higher_tf_ok}")
         return "BUY"
-
-    if basic_sell:
-        return "SELL"
 
     return None
 

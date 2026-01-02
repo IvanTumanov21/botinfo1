@@ -42,6 +42,11 @@ class BybitExchange:
                 testnet=self.testnet,
             )
             
+            # Проверка подключения через pybit
+            test = self.client.get_wallet_balance(accountType="UNIFIED")
+            if test.get('retCode') != 0:
+                raise Exception(f"pybit error: {test}")
+            
             # ccxt
             self.ccxt = ccxt.bybit({
                 'apiKey': self.api_key,

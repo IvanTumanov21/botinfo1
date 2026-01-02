@@ -245,6 +245,9 @@ class MarketScanner:
             return []
         
         signals = []
+        total = len(self.symbols)
+        
+        logger.info(f"🔍 Начинаем сканирование {total} пар...")
         
         # Сканируем с задержкой для rate limit
         for i, symbol in enumerate(self.symbols):
@@ -254,14 +257,16 @@ class MarketScanner:
                     signals.append(signal)
                     logger.info(f"🚀 Найден сигнал: {symbol}")
                 
-                # Rate limit: пауза каждые 10 пар
+                # Rate limit: пауза каждые 10 пар + логирование прогресса
                 if (i + 1) % 10 == 0:
+                    logger.info(f"📊 Просканировано {i+1}/{total} пар...")
                     await asyncio.sleep(1)
                     
             except Exception as e:
                 logger.error(f"Ошибка сканирования {symbol}: {e}")
                 continue
         
+        logger.info(f"✅ Сканирование завершено. Сигналов: {len(signals)}")
         return signals
     
     async def save_signal_to_db(self, signal: Dict) -> int:

@@ -1,7 +1,7 @@
 # Основные
 python-telegram-bot==20.7
-ccxt==4.2.0
-pybit==5.6.2
+ccxt>=4.0.0
+pybit>=5.6.0
 
 # База данных
 sqlalchemy==2.0.23

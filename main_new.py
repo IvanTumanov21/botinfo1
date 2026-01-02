@@ -48,9 +48,11 @@ async def scan_loop():
     global running
     
     logger.info("🔍 Запуск цикла сканирования...")
+    await asyncio.sleep(5)  # Даём время на инициализацию
     
     while running:
         try:
+            logger.info("🔄 Начинаем сканирование...")
             # Сканируем рынок
             signals = await scanner.scan_all()
             

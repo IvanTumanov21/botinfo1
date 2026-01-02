@@ -162,13 +162,14 @@ async def main():
     logger.info("=" * 50)
     
     # 8. Запускаем рабочие циклы
+    logger.info("🔄 Запуск фоновых тасков...")
     scan_task = asyncio.create_task(scan_loop())
     position_task = asyncio.create_task(position_loop())
+    logger.info("✅ Таски созданы")
     
     # 9. Ждём завершения
     try:
-        while running:
-            await asyncio.sleep(1)
+        await asyncio.gather(scan_task, position_task, return_exceptions=True)
     except asyncio.CancelledError:
         pass
     

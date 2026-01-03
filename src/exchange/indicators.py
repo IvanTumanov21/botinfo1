@@ -225,21 +225,6 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
     except Exception as e:
         logger.error(f"Ошибка определения пробоя: {e}")
         return False, {}
-            "prev_high_20": prev_high_20,
-            "current_close": last['close'],
-            "ema100": last['ema100'],
-            "volume_ratio": round(last['volume_ratio'], 2),
-            "breakout_high": breakout_high,
-            "above_ema100": above_ema100,
-            "ema_cross": ema_cross,
-            "volume_spike": volume_spike,
-        }
-        
-        return is_breakout, metrics
-        
-    except Exception as e:
-        logger.error(f"Ошибка определения пробоя: {e}")
-        return False, {}
 
 
 def check_false_pump_filter(

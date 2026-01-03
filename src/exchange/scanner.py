@@ -79,7 +79,7 @@ class MarketScanner:
                 DailyStats.date == today
             ).first()
             
-            if stats and stats.stop_losses_today >= ANTI_FOMO["max_daily_losses"]:
+            if stats and stats.stop_losses_today >= RISK_MANAGEMENT["max_daily_losses"]:
                 conditions["can_trade"] = False
                 conditions["reasons"].append(
                     f"Достигнут лимит стопов ({stats.stop_losses_today})"

@@ -8,7 +8,7 @@ from loguru import logger
 
 from telegram import (
     Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputFile
+    InputFile, BotCommand
 )
 from telegram.ext import Application, ContextTypes
 from telegram.constants import ParseMode
@@ -30,6 +30,14 @@ class TelegramBot:
         """Инициализация бота"""
         self.app = Application.builder().token(self.token).build()
         self.bot = self.app.bot
+        # Регистрируем команды, чтобы кнопка меню была доступна в строке ввода
+        await self.bot.set_my_commands([
+            BotCommand("start", "Меню"),
+            BotCommand("status", "Статус бота"),
+            BotCommand("balance", "Баланс"),
+            BotCommand("positions", "Позиции"),
+            BotCommand("history", "История сделок"),
+        ])
         logger.info("✅ Telegram бот инициализирован")
         
     async def send_signal(self, signal: Dict, signal_id: int) -> Optional[int]:

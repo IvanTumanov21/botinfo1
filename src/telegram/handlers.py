@@ -2,8 +2,9 @@
 Обработчики команд и кнопок Telegram
 """
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 from loguru import logger
+import html
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -11,11 +12,12 @@ from telegram.ext import (
     ContextTypes
 )
 
-from src.config import TELEGRAM_CHAT_ID, RISK_MANAGEMENT
+from src.config import TELEGRAM_CHAT_ID, RISK_MANAGEMENT, PRESIGNALS
 from src.database import (
     get_db, Signal, SignalStatus, Position, PositionStatus,
-    Trade, DailyStats
+    Trade, DailyStats, Holding
 )
+from src.trading.portfolio_sync import sync_holdings
 
 if TYPE_CHECKING:
     from src.exchange import BybitExchange
@@ -48,7 +50,20 @@ def is_authorized(update: Update) -> bool:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start - главное меню"""
+    user_id = None
+    if update.message:
+        user_id = update.message.from_user.id
+        logger.info(f"📍 Команда /start от {user_id} (ожидается {TELEGRAM_CHAT_ID})")
+    
+    # Проверяем авторизацию
     if not is_authorized(update):
+        logger.warning(f"❌ Неавторизованный /start: {user_id}")
+        try:
+            await update.message.reply_text(
+                f"❌ Доступ запрещён.\nВаш ID: {user_id}"
+            )
+        except Exception as e:
+            logger.error(f"Ошибка отправки сообщения об ошибке: {e}")
         return
     
     keyboard = [
@@ -62,6 +77,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ],
         [
             InlineKeyboardButton("⚙️ Сканирование", callback_data="scan_toggle"),
+            InlineKeyboardButton("🎯 Предсигналы", callback_data="presignals_menu"),
         ],
     ]
     
@@ -74,11 +90,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 Нажми кнопку для управления:
 """
     
-    await update.message.reply_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    try:
+        await update.message.reply_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        logger.info(f"✅ Меню отправлено пользователю {user_id}")
+
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки меню: {e}")
+        try:
+            await update.message.reply_text(f"❌ Ошибка: {str(e)[:100]}")
+        except:
+            pass
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -206,8 +231,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data
     
-    # Кнопка "Купить"
-    if data.startswith("buy_"):
+    # Кнопка "Купить" (выбор суммы) или конкретная сумма
+    if data.startswith("buy_amt_"):
+        _, _, signal_id_str, amount_str = data.split("_", 3)
+        signal_id = int(signal_id_str)
+        amount_usdt = None if amount_str == "auto" else float(amount_str)
+        await handle_buy_signal(query, signal_id, amount_usdt)
+    elif data.startswith("buy_"):
         signal_id = int(data.split("_")[1])
         await handle_buy_signal(query, signal_id)
     
@@ -242,11 +272,47 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "history":
         await handle_history(query)
     
-    # Сканирование вкл/выкл
+    # Сканирование меню
     elif data == "scan_toggle":
         await handle_scan_toggle(query)
     
+    # Переключение сканирования
+    elif data == "scan_toggle_switch":
+        await handle_scan_toggle_switch(query)
+    
+    # Меню предсигналов
+    elif data == "presignals_menu":
+        await handle_presignals_menu(query)
+    
+    # Переключение предсигналов
+    elif data == "presignals_toggle":
+        await handle_presignals_toggle(query)
+    
+    # Список предсигналов
+    elif data == "presignals_list":
+        await query.edit_message_text(
+            "📊 <b>Текущие предсигналы</b>\n\n"
+            "Скоро здесь появится список активных предсигналов...",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="presignals_menu")]])
+        )
+    
+    # Интервал предсигналов
+    elif data == "presignals_interval":
+        await handle_presignals_interval(query)
+    
+    # Установка интервала
+    elif data.startswith("presignals_interval_set_"):
+        interval = int(data.split("_")[-1])
+        await handle_presignals_interval_set(query, interval)
+    
     # Принудительный скан
+    elif data == "force_scan":
+        await handle_force_scan(query)
+    
+    # Вернуться в главное меню
+    elif data == "back_to_main":
+        await handle_back_to_main(query)
     elif data == "force_scan":
         await handle_force_scan(query)
     
@@ -259,138 +325,286 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-async def handle_buy_signal(query, signal_id: int):
-    """Обработка нажатия кнопки "Купить" """
-    with get_db() as db:
-        signal = db.query(Signal).filter(Signal.id == signal_id).first()
-        
-        if not signal:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("❌ Сигнал не найден", callback_data="noop")]
-                ])
-            )
+async def handle_buy_signal(query, signal_id: int, amount_usdt: Optional[float] = None):
+    """Обработка нажатия кнопки "Купить" с выбором суммы"""
+    try:
+        # Если сумма не выбрана — показать быстрые кнопки
+        if amount_usdt is None:
+            keyboard = [
+                [
+                    InlineKeyboardButton("$25", callback_data=f"buy_amt_{signal_id}_25"),
+                    InlineKeyboardButton("$50", callback_data=f"buy_amt_{signal_id}_50"),
+                ],
+                [
+                    InlineKeyboardButton("$100", callback_data=f"buy_amt_{signal_id}_100"),
+                    InlineKeyboardButton("$200", callback_data=f"buy_amt_{signal_id}_200"),
+                ],
+                [
+                    InlineKeyboardButton("Авто (из настроек)", callback_data=f"buy_amt_{signal_id}_auto"),
+                ],
+                [InlineKeyboardButton("🔙 Отмена", callback_data="noop")]
+            ]
+            await query.answer("Выбери сумму сделки", show_alert=False)
+            await query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
             return
         
-        if signal.status != SignalStatus.PENDING:
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"⚠️ Уже обработан: {signal.status.value}", callback_data="noop")]
-                ])
-            )
-            return
+        # 1. Быстрое обновление статуса (должна быть асинхронной или не блокировать)
+        with get_db() as db:
+            signal = db.query(Signal).filter(Signal.id == signal_id).first()
+            
+            if not signal:
+                await query.answer("❌ Сигнал не найден", show_alert=True)
+                return
+            
+            if signal.status != SignalStatus.PENDING:
+                await query.answer(f"⚠️ Уже обработан: {signal.status.value}", show_alert=True)
+                return
+            
+            symbol = signal.symbol
+            
+            # Проверяем, не ушла ли цена
+            current_price = signal.price
+            if exchange:
+                try:
+                    ticker = await exchange.get_ticker(signal.symbol)
+                    if ticker:
+                        current_price = ticker['last']
+                except:
+                    pass
+            
+            price_diff = (current_price - signal.price) / signal.price
+            
+            if price_diff > 0.01:  # Цена ушла больше чем на 1%
+                await query.answer(f"⏰ Цена ушла на +{price_diff*100:.2f}%", show_alert=True)
+                signal.status = SignalStatus.EXPIRED
+                db.commit()
+                return
+            
+            # Обновляем статус в БД (быстро)
+            signal.status = SignalStatus.ACCEPTED
+            signal.decided_at = datetime.now(timezone.utc)
+            
+            # Обновляем дневную статистику
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            stats = db.query(DailyStats).filter(DailyStats.date == today).first()
+            if stats:
+                stats.signals_accepted += 1
+            
+            db.commit()
         
-        # Проверяем, не ушла ли цена
-        current_price = signal.price
-        if exchange:
-            ticker = await exchange.get_ticker(signal.symbol)
-            if ticker:
-                current_price = ticker['last']
+        # 2. Сразу отвечаем пользователю
+        await query.answer("✅ Принимаю сигнал, создаю ордер...", show_alert=False)
         
-        price_diff = (current_price - signal.price) / signal.price
-        
-        if price_diff > 0.01:  # Цена ушла больше чем на 1%
-            signal.status = SignalStatus.EXPIRED
-            await query.edit_message_reply_markup(
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton(f"⏰ Цена ушла (+{price_diff*100:.1f}%)", callback_data="noop")]
-                ])
-            )
-            return
-        
-        # Обновляем статус
-        signal.status = SignalStatus.ACCEPTED
-        signal.decided_at = datetime.now(timezone.utc)
-        
-        # Обновляем дневную статистику
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        stats = db.query(DailyStats).filter(DailyStats.date == today).first()
-        if stats:
-            stats.signals_accepted += 1
-    
-    # Редактируем сообщение
-    await query.edit_message_reply_markup(
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ ПРИНЯТ - Исполняется...", callback_data="noop")]
-        ])
-    )
-    
-    # Исполняем ордер (будет в order_executor)
-    # Здесь вызов execute_buy_order(signal)
-    logger.info(f"✅ Сигнал {signal_id} принят, создаём ордер")
-    
-    # Отправляем подтверждение
-    if telegram_bot:
-        await telegram_bot.send_message(
-            f"📝 Создаю лимитный ордер на покупку {signal.symbol}...\n"
-            f"Цена входа: {signal.entry_price:.6f}"
+        # 3. Редактируем сообщение (неблокирующее)
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ ПРИНЯТ", callback_data="noop")],
+                [InlineKeyboardButton("🔄 Исполняется...", callback_data="noop")]
+            ])
         )
+        
+        # 4. Создаём ордер в фоне (асинхронно)
+        if exchange:
+            from src.trading.executor import OrderExecutor
+            executor = OrderExecutor(exchange)
+            
+            try:
+                position = await executor.execute_buy_from_signal(signal_id, amount_usdt_override=amount_usdt)
+                if position:
+                    logger.info(f"✅ Позиция открыта: {position['symbol']} ID={position['id']}")
+                    # Отправляем подтверждение
+                    if telegram_bot:
+                        await telegram_bot.send_message(
+                            f"✅ <b>Ордер выполнен!</b>\n\n"
+                            f"📍 {position['symbol']}\n"
+                            f"💵 Вход: {position['entry_price']:.6f}\n"
+                            f"📊 Объём: {position['entry_amount']:.6f}\n"
+                            f"💰 Сумма: {position['entry_value_usdt']:.2f} USDT"
+                        )
+                else:
+                    logger.error(f"❌ Не удалось открыть позицию для сигнала {signal_id}")
+                    if telegram_bot:
+                        await telegram_bot.send_message(
+                            f"❌ Не удалось создать ордер на {symbol}\n"
+                            f"Проверьте баланс и лимиты!"
+                        )
+            except Exception as e:
+                logger.error(f"❌ Ошибка при создании позиции: {e}")
+                if telegram_bot:
+                    safe_err = html.escape(str(e))[:200]
+                    await telegram_bot.send_message(
+                        f"❌ Ошибка исполнения: {safe_err}"
+                    )
+    
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_buy_signal: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
 
 
 async def handle_skip_signal(query, signal_id: int):
     """Обработка нажатия кнопки "Пропустить" """
-    with get_db() as db:
-        signal = db.query(Signal).filter(Signal.id == signal_id).first()
+    try:
+        with get_db() as db:
+            signal = db.query(Signal).filter(Signal.id == signal_id).first()
+            
+            if not signal or signal.status != SignalStatus.PENDING:
+                return
+            
+            signal.status = SignalStatus.REJECTED
+            signal.decided_at = datetime.now(timezone.utc)
+            
+            # Обновляем статистику
+            today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            stats = db.query(DailyStats).filter(DailyStats.date == today).first()
+            if stats:
+                stats.signals_rejected += 1
+            
+            db.commit()
         
-        if not signal:
-            return
+        # Быстрый ответ
+        await query.answer("⏭ Сигнал пропущен", show_alert=False)
         
-        if signal.status != SignalStatus.PENDING:
-            return
+        # Асинхронно обновляем сообщение
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("⏭ ПРОПУЩЕН", callback_data="noop")]
+            ])
+        )
         
-        signal.status = SignalStatus.REJECTED
-        signal.decided_at = datetime.now(timezone.utc)
-        
-        # Обновляем статистику
-        today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-        stats = db.query(DailyStats).filter(DailyStats.date == today).first()
-        if stats:
-            stats.signals_rejected += 1
-    
-    await query.edit_message_reply_markup(
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏭ ПРОПУЩЕН", callback_data="noop")]
-        ])
-    )
-    
-    logger.info(f"⏭ Сигнал {signal_id} пропущен")
+        logger.info(f"⏭ Сигнал {signal_id} пропущен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_skip_signal: {e}")
 
 
 async def handle_chart(query, symbol: str):
-    """Отправка графика"""
-    # TODO: Генерация графика через mplfinance
-    await query.message.reply_text(
-        f"📊 График {symbol}\n\n"
-        f"<i>Функция в разработке</i>",
-        parse_mode="HTML"
-    )
+    """Отправка графика с информацией о паре"""
+    try:
+        # Быстрый ответ
+        await query.answer("📊 Загружаю данные о паре...", show_alert=False)
+        
+        if not exchange:
+            await query.edit_message_text(
+                "❌ Биржа не подключена",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="noop")]])
+            )
+            return
+        
+        # Получаем данные с биржи
+        ticker = await exchange.get_ticker(symbol)
+        
+        if not ticker:
+            await query.edit_message_text(
+                f"❌ Не удалось получить данные по {symbol}",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data="noop")]])
+            )
+            return
+        
+        last_price = ticker.get('last', 0)
+        bid = ticker.get('bid', 0)
+        ask = ticker.get('ask', 0)
+        volume_24h = ticker.get('volume24h', 0)
+        
+        # Получаем исторические данные для изменения цены
+        klines = await exchange.get_klines(symbol, "1h", limit=24)
+        
+        change_24h = 0
+        if klines and len(klines) > 0:
+            open_price = float(klines[0][1])
+            change_24h = ((last_price - open_price) / open_price) * 100
+        
+        change_emoji = "🟢" if change_24h >= 0 else "🔴"
+        
+        text = f"""
+📊 <b>{symbol}</b>
+
+<b>Цена:</b>
+• Текущая: {last_price:.8g}
+• Bid: {bid:.8g}
+• Ask: {ask:.8g}
+
+<b>Изменение:</b>
+{change_emoji} {change_24h:+.2f}% (24ч)
+
+<b>Объём:</b>
+{volume_24h:.2f} USDT (24ч)
+"""
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="noop")]]
+        
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        logger.info(f"📊 Запрос графика {symbol}")
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_chart: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
 
 
 async def handle_close_position(query, position_id: int):
     """Закрытие позиции вручную"""
-    with get_db() as db:
-        position = db.query(Position).filter(Position.id == position_id).first()
+    try:
+        with get_db() as db:
+            position = db.query(Position).filter(Position.id == position_id).first()
+            
+            if not position:
+                await query.answer("❌ Позиция не найдена", show_alert=True)
+                return
+            
+            if position.status not in [
+                PositionStatus.OPEN, 
+                PositionStatus.PARTIAL_TP1, 
+                PositionStatus.PARTIAL_TP2
+            ]:
+                await query.answer(f"⚠️ Уже закрыта: {position.status.value}", show_alert=True)
+                return
+            
+            symbol = position.symbol
+            amount = position.current_amount
         
-        if not position:
-            await query.edit_message_text("❌ Позиция не найдена")
-            return
+        # Быстрый ответ
+        await query.answer("✅ Закрываю позицию...", show_alert=False)
         
-        if position.status not in [
-            PositionStatus.OPEN, 
-            PositionStatus.PARTIAL_TP1, 
-            PositionStatus.PARTIAL_TP2
-        ]:
-            await query.edit_message_text(f"⚠️ Позиция уже закрыта: {position.status.value}")
-            return
+        # Закрываем позицию в фоне
+        if exchange:
+            from src.trading.executor import OrderExecutor
+            executor = OrderExecutor(exchange)
+            
+            try:
+                trade = await executor.execute_sell(
+                    position_id=position_id,
+                    amount=amount,
+                    reason="MANUAL",
+                    use_market=True
+                )
+                
+                if trade:
+                    logger.info(f"✅ Позиция {symbol} закрыта вручную")
+                    if telegram_bot:
+                        await telegram_bot.send_message(
+                            f"✅ <b>Позиция закрыта!</b>\n\n"
+                            f"📍 {symbol}\n"
+                            f"💵 Цена выхода: {trade.price:.6f}\n"
+                            f"📊 Объём: {trade.amount:.6f}"
+                        )
+                else:
+                    logger.error(f"❌ Не удалось закрыть позицию {position_id}")
+                    if telegram_bot:
+                        await telegram_bot.send_message(
+                            f"❌ Не удалось закрыть позицию {symbol}"
+                        )
+            except Exception as e:
+                logger.error(f"❌ Ошибка при закрытии: {e}")
+                if telegram_bot:
+                    safe_err = html.escape(str(e))[:200]
+                    await telegram_bot.send_message(f"❌ Ошибка: {safe_err}")
     
-    # Закрываем позицию (будет в order_executor)
-    logger.info(f"🔴 Закрываем позицию {position_id} вручную")
-    
-    await query.edit_message_text(
-        f"🔄 Закрываю позицию {position.symbol}...\n"
-        f"<i>Создаю маркет ордер на продажу</i>",
-        parse_mode="HTML"
-    )
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_close_position: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:50]}", show_alert=True)
 
 
 async def handle_status(query):
@@ -410,6 +624,9 @@ async def handle_status(query):
         
         today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
         stats = db.query(DailyStats).filter(DailyStats.date == today).first()
+        # Сохраняем значения до выхода из сессии, чтобы избежать DetachedInstanceError
+        stats_signals_sent = stats.signals_sent if stats else 0
+        stats_total_pnl_usdt = stats.total_pnl_usdt if stats else 0.0
     
     btc_change = 0.0
     if exchange:
@@ -425,8 +642,8 @@ async def handle_status(query):
 <b>Ожидают:</b> {pending_signals}
 
 <b>Сегодня:</b>
-• Сигналов: {stats.signals_sent if stats else 0}
-• P&L: ${stats.total_pnl_usdt if stats else 0:+.2f}
+• Сигналов: {stats_signals_sent}
+• P&L: ${stats_total_pnl_usdt:+.2f}
 """
     
     keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
@@ -440,112 +657,199 @@ async def handle_status(query):
 
 async def handle_balance(query):
     """Показать баланс"""
-    if not exchange:
-        await query.edit_message_text("❌ Биржа не подключена")
-        return
-    
-    balance = await exchange.get_balance()
-    
-    usdt = balance.get('USDT', {})
-    
-    text = f"""
+    try:
+        if not exchange:
+            await query.edit_message_text("❌ Биржа не подключена")
+            return
+        
+        # Обновляем данные в БД, чтобы поймать ручные покупки
+        await sync_holdings(exchange)
+        
+        balance = await exchange.get_balance()
+        usdt = balance.get('USDT', {})
+        
+        # Загружаем актуальные холдинги и сохраняем данные до закрытия сессии
+        with get_db() as db:
+            holdings = db.query(Holding).all()
+            # Сохраняем данные в список словарей
+            holdings_data = [
+                {
+                    'symbol': h.symbol,
+                    'amount': h.amount,
+                    'avg_entry_price': h.avg_entry_price,
+                    'last_price': h.last_price
+                }
+                for h in holdings
+            ]
+        
+        total_portfolio_usdt = 0.0
+        total_pnl_usdt = 0.0
+        assets_lines = ""
+        
+        for h_data in holdings_data:
+            ticker = await exchange.get_ticker(h_data['symbol'])
+            last_price = ticker['last'] if ticker else (h_data['last_price'] or h_data['avg_entry_price'])
+            value_usdt = h_data['amount'] * last_price
+            pnl_usdt = (last_price - h_data['avg_entry_price']) * h_data['amount']
+            pnl_pct = (last_price / h_data['avg_entry_price'] - 1) * 100 if h_data['avg_entry_price'] else 0.0
+            total_portfolio_usdt += value_usdt
+            total_pnl_usdt += pnl_usdt
+            assets_lines += (
+                f"\n<b>{h_data['symbol'].split('/')[0]}:</b> {h_data['amount']:.6f}"
+                f" (≈ {value_usdt:.2f} USDT, P&L: {pnl_usdt:+.2f} USDT / {pnl_pct:+.2f}%)"
+            )
+        assets_block = assets_lines if assets_lines else "Нет других активов"
+        
+        text = f"""
 💰 <b>Баланс</b>
 
 <b>USDT:</b>
 • Свободно: {usdt.get('free', 0):.2f}
 • В ордерах: {usdt.get('used', 0):.2f}
 • Всего: {usdt.get('total', 0):.2f}
+
+<b>Портфель (кроме USDT):</b> {total_portfolio_usdt:.2f} USDT
+<b>P&L по активам:</b> {total_pnl_usdt:+.2f} USDT
+{assets_block}
 """
-    
-    # Добавляем другие активы
-    for currency, data in balance.items():
-        if currency != 'USDT' and data.get('total', 0) > 0:
-            text += f"\n<b>{currency}:</b> {data.get('total', 0):.6f}"
-    
-    keyboard = [
-        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
-    ]
-    
-    await query.edit_message_text(
-        text, 
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+        
+        keyboard = [
+            [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]
+        ]
+        
+        await query.edit_message_text(
+            text, 
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"❌ Ошибка в handle_balance: {e}")
+        await query.answer(f"❌ Ошибка: {str(e)[:80]}", show_alert=True)
 
 
 async def handle_positions_list(query):
     """Список позиций"""
-    with get_db() as db:
-        positions = db.query(Position).filter(
-            Position.status.in_([
-                PositionStatus.OPEN,
-                PositionStatus.PARTIAL_TP1,
-                PositionStatus.PARTIAL_TP2
+    try:
+        with get_db() as db:
+            positions = db.query(Position).filter(
+                Position.status.in_([
+                    PositionStatus.OPEN,
+                    PositionStatus.PARTIAL_TP1,
+                    PositionStatus.PARTIAL_TP2
+                ])
+            ).all()
+        
+        if not positions:
+            text = "📭 Нет открытых позиций"
+            keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
+            await query.edit_message_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            return
+        
+        text = "📈 <b>Открытые позиции</b>\n"
+        keyboard = []
+        
+        for pos in positions:
+            current_price = pos.entry_price
+            if exchange:
+                try:
+                    ticker = await exchange.get_ticker(pos.symbol)
+                    if ticker:
+                        current_price = ticker['last']
+                except Exception as e:
+                    logger.warning(f"Ошибка получения цены {pos.symbol}: {e}")
+            
+            pnl_pct = (current_price / pos.entry_price - 1) * 100
+            pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
+            
+            text += f"\n{pnl_emoji} <b>{pos.symbol}</b>: {pnl_pct:+.1f}%"
+            
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"❌ Закрыть {pos.symbol.split('/')[0]}", 
+                    callback_data=f"close_{pos.id}"
+                )
             ])
-        ).all()
-    
-    if not positions:
-        text = "📭 Нет открытых позиций"
-        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
+        
+        keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
+        
         await query.edit_message_text(
             text,
+            parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        return
-    
-    text = "📈 <b>Открытые позиции</b>\n"
-    keyboard = []
-    
-    for pos in positions:
-        current_price = pos.entry_price
-        if exchange:
-            ticker = await exchange.get_ticker(pos.symbol)
-            if ticker:
-                current_price = ticker['last']
-        
-        pnl_pct = (current_price / pos.entry_price - 1) * 100
-        pnl_emoji = "🟢" if pnl_pct >= 0 else "🔴"
-        
-        text += f"\n{pnl_emoji} <b>{pos.symbol}</b>: {pnl_pct:+.1f}%"
-        
-        keyboard.append([
-            InlineKeyboardButton(
-                f"❌ Закрыть {pos.symbol.split('/')[0]}", 
-                callback_data=f"close_{pos.id}"
-            )
-        ])
-    
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")])
-    
-    await query.edit_message_text(
-        text,
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup(keyboard)
-    )
+    except Exception as e:
+        logger.error(f"Ошибка handle_positions_list: {e}")
+        await query.answer("❌ Ошибка при загрузке позиций", show_alert=True)
 
 
 async def handle_history(query):
     """История сделок"""
-    with get_db() as db:
-        trades = db.query(Trade).order_by(
-            Trade.created_at.desc()
-        ).limit(10).all()
-    
-    if not trades:
-        text = "📭 История пуста"
-    else:
-        text = "📋 <b>Последние сделки</b>\n"
+    try:
+        with get_db() as db:
+            trades = db.query(Trade).order_by(
+                Trade.created_at.desc()
+            ).limit(10).all()
         
-        for trade in trades:
-            side_emoji = "🟢" if trade.side == "BUY" else "🔴"
-            pnl_text = ""
-            if trade.pnl_usdt is not None:
-                pnl_emoji = "✅" if trade.pnl_usdt >= 0 else "❌"
-                pnl_text = f" | {pnl_emoji} ${trade.pnl_usdt:+.2f}"
+        if not trades:
+            text = "📭 История пуста"
+        else:
+            text = "📋 <b>Последние сделки</b>\n"
             
-            text += f"\n{side_emoji} {trade.symbol} @ {trade.price:.6f}{pnl_text}"
+            for trade in trades:
+                side_emoji = "🟢" if trade.side == "BUY" else "🔴"
+                pnl_text = ""
+                if trade.pnl_usdt is not None:
+                    pnl_emoji = "✅" if trade.pnl_usdt >= 0 else "❌"
+                    pnl_text = f" | {pnl_emoji} ${trade.pnl_usdt:+.2f}"
+                
+                text += f"\n{side_emoji} {trade.symbol} @ {trade.price:.6f}{pnl_text}"
+        
+        keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
+        
+        await query.edit_message_text(
+            text,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+    except Exception as e:
+        logger.error(f"Ошибка handle_history: {e}")
+        await query.answer("❌ Ошибка при загрузке истории", show_alert=True)
+
+
+async def handle_scan_toggle(query):
+    """Меню сканирования с переключателем вкл/выкл"""
+    from src.database.models import BotSettings
     
-    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")]]
+    # Проверяем состояние в БД
+    with get_db() as db:
+        setting = db.query(BotSettings).filter(BotSettings.key == "scan_enabled").first()
+        if setting:
+            enabled = setting.value.lower() == "true"
+        else:
+            enabled = False
+    
+    status = "🟢 Включено" if enabled else "🔴 Выключено"
+    toggle_text = "⏸️ Выключить" if enabled else "▶️ Включить"
+    
+    keyboard = [
+        [InlineKeyboardButton(toggle_text, callback_data="scan_toggle_switch")],
+        [InlineKeyboardButton("🔍 Сканировать сейчас", callback_data="force_scan")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
+    ]
+    
+    text = f"""
+⚙️ <b>Сканирование</b>
+
+Статус: {status}
+
+• Автоскан каждые 60 сек (когда включен)
+• Проверка позиций каждые 30 сек
+
+Нажми "{toggle_text}" чтобы переключить.
+"""
     
     await query.edit_message_text(
         text,
@@ -554,21 +858,215 @@ async def handle_history(query):
     )
 
 
-async def handle_scan_toggle(query):
-    """Меню сканирования"""
+async def handle_scan_toggle_switch(query):
+    """Переключение сканирования вкл/выкл"""
+    from src.database.models import BotSettings
+    
+    with get_db() as db:
+        setting = db.query(BotSettings).filter(BotSettings.key == "scan_enabled").first()
+        
+        if not setting:
+            setting = BotSettings(key="scan_enabled", value="True")
+            db.add(setting)
+            new_state = True
+        else:
+            current = setting.value.lower() == "true"
+            new_state = not current
+            setting.value = str(new_state)
+        
+        db.commit()
+    
+    status_emoji = "✅ Включено" if new_state else "⏸️ Выключено"
+    
+    await query.answer(f"Сканирование {status_emoji}", show_alert=False)
+    
+    # Возвращаемся в меню сканирования
+    await handle_scan_toggle(query)
+
+
+async def handle_presignals_menu(query):
+    """Меню управления предсигналами"""
+    from src.database.models import BotSettings
+    
+    # Проверяем состояние в БД
+    with get_db() as db:
+        setting = db.query(BotSettings).filter(BotSettings.key == "presignals_enabled").first()
+        if setting:
+            enabled = setting.value.lower() == "true"
+        else:
+            enabled = PRESIGNALS["enabled"]
+    
+    status = "🟢 Включены" if enabled else "🔴 Отключены"
+    
+    # Получаем интервал из БД
+    with get_db() as db:
+        interval_setting = db.query(BotSettings).filter(BotSettings.key == "presignals_interval").first()
+        if interval_setting:
+            interval = int(interval_setting.value)
+        else:
+            interval = PRESIGNALS["check_interval_minutes"]
+    
     keyboard = [
-        [InlineKeyboardButton("🔍 Сканировать сейчас", callback_data="force_scan")],
+        [
+            InlineKeyboardButton("🔔 Включить" if not enabled else "🔕 Отключить", 
+                               callback_data="presignals_toggle")
+        ],
+        [InlineKeyboardButton("📊 Показать текущие", callback_data="presignals_list")],
+        [InlineKeyboardButton("⚙️ Интервал", callback_data="presignals_interval")],
         [InlineKeyboardButton("🔙 Назад", callback_data="back_to_main")],
     ]
     
-    text = """
-⚙️ <b>Сканирование</b>
+    text = f"""
+🎯 <b>Предсигналы</b>
 
-• Автоскан каждые 60 сек
-• Проверка позиций каждые 30 сек
+Статус: {status}
+Интервал проверки: каждые {interval} мин
+Минимум условий: {PRESIGNALS["min_conditions_met"]}/4
 
-Нажми "Сканировать сейчас" для принудительного поиска сигналов.
+<b>Предсигнал</b> - это уведомление о паре, которая близка к полному сигналу (выполняет 2-3 условия).
+
+Например:
+✅ EMA структура
+✅ RSI в импульсной зоне
+❌ Рост свечи
+❌ Volume spike
 """
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_presignals_toggle(query):
+    """Переключение предсигналов вкл/выкл"""
+    from src.database.models import BotSettings
+    
+    with get_db() as db:
+        # Получаем текущее состояние из БД
+        setting = db.query(BotSettings).filter(BotSettings.key == "presignals_enabled").first()
+        
+        if not setting:
+            # Создаём запись если её нет
+            current = PRESIGNALS["enabled"]
+            setting = BotSettings(key="presignals_enabled", value=str(current))
+            db.add(setting)
+        
+        # Переключаем состояние
+        current = setting.value.lower() == "true"
+        new_state = not current
+        setting.value = str(new_state)
+        db.commit()
+    
+    status_emoji = "✅ Включены" if new_state else "❌ Отключены"
+    
+    text = f"""
+🎯 <b>Предсигналы {status_emoji}</b>
+
+Настройка сохранена!
+Предсигналы будут {'отправляться' if new_state else 'остановлены'} при следующей проверке.
+"""
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="presignals_menu")]]
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_presignals_interval(query):
+    """Выбор интервала проверки предсигналов"""
+    from src.database.models import BotSettings
+    
+    # Получаем текущий интервал
+    with get_db() as db:
+        setting = db.query(BotSettings).filter(BotSettings.key == "presignals_interval").first()
+        if setting:
+            current_interval = int(setting.value)
+        else:
+            current_interval = PRESIGNALS["check_interval_minutes"]
+    
+    # Кнопки выбора интервала
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"1 мин{'  ✅' if current_interval == 1 else ''}", 
+                callback_data="presignals_interval_set_1"
+            ),
+            InlineKeyboardButton(
+                f"2 мин{'  ✅' if current_interval == 2 else ''}", 
+                callback_data="presignals_interval_set_2"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"5 мин{'  ✅' if current_interval == 5 else ''}", 
+                callback_data="presignals_interval_set_5"
+            ),
+            InlineKeyboardButton(
+                f"10 мин{'  ✅' if current_interval == 10 else ''}", 
+                callback_data="presignals_interval_set_10"
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"15 мин{'  ✅' if current_interval == 15 else ''}", 
+                callback_data="presignals_interval_set_15"
+            ),
+            InlineKeyboardButton(
+                f"30 мин{'  ✅' if current_interval == 30 else ''}", 
+                callback_data="presignals_interval_set_30"
+            ),
+        ],
+        [InlineKeyboardButton("🔙 Назад", callback_data="presignals_menu")],
+    ]
+    
+    text = f"""
+⏰ <b>Интервал проверки предсигналов</b>
+
+Текущий интервал: <b>{current_interval} мин</b>
+
+Выбери новый интервал:
+"""
+    
+    await query.edit_message_text(
+        text,
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def handle_presignals_interval_set(query, interval_minutes: int):
+    """Установка интервала проверки предсигналов"""
+    from src.database.models import BotSettings
+    
+    with get_db() as db:
+        setting = db.query(BotSettings).filter(BotSettings.key == "presignals_interval").first()
+        
+        if not setting:
+            # Создаём новую запись
+            setting = BotSettings(key="presignals_interval", value=str(interval_minutes))
+            db.add(setting)
+        else:
+            # Обновляем существующую
+            setting.value = str(interval_minutes)
+        
+        db.commit()
+    
+    text = f"""
+✅ <b>Интервал сохранён!</b>
+
+Предсигналы будут проверяться каждые <b>{interval_minutes} минут</b>
+
+Изменение вступит в силу при следующей проверке.
+"""
+    
+    keyboard = [[InlineKeyboardButton("🔙 Назад", callback_data="presignals_menu")]]
+    
+    await query.answer(f"✅ Интервал установлен: {interval_minutes} мин", show_alert=False)
     
     await query.edit_message_text(
         text,
@@ -602,6 +1100,7 @@ async def handle_back_to_main(query):
         ],
         [
             InlineKeyboardButton("⚙️ Сканирование", callback_data="scan_toggle"),
+            InlineKeyboardButton("🎯 Предсигналы", callback_data="presignals_menu"),
         ],
     ]
     

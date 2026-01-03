@@ -88,8 +88,12 @@ class PositionManager:
                     return {
                         'action': 'SL',
                         'position_id': pos['id'],
-                        'symbol': pos['symbol'],
-                        'price': current_price,
+                        'symbol': result['symbol'],
+                        'side': result['side'],
+                        'price': result['price'],
+                        'amount': result['amount'],
+                        'value_usdt': result['value_usdt'],
+                        'reason': result['reason'],
                         'pnl_pct': result['pnl_pct'],
                         'pnl_usdt': result['pnl_usdt'],
                     }
@@ -112,8 +116,12 @@ class PositionManager:
                     return {
                         'action': 'TP1',
                         'position_id': pos['id'],
-                        'symbol': pos['symbol'],
-                        'price': current_price,
+                        'symbol': result['symbol'],
+                        'side': result['side'],
+                        'price': result['price'],
+                        'amount': result['amount'],
+                        'value_usdt': result['value_usdt'],
+                        'reason': result['reason'],
                         'pnl_pct': result['pnl_pct'],
                         'pnl_usdt': result['pnl_usdt'],
                     }
@@ -136,8 +144,12 @@ class PositionManager:
                     return {
                         'action': 'TP2',
                         'position_id': pos['id'],
-                        'symbol': pos['symbol'],
-                        'price': current_price,
+                        'symbol': result['symbol'],
+                        'side': result['side'],
+                        'price': result['price'],
+                        'amount': result['amount'],
+                        'value_usdt': result['value_usdt'],
+                        'reason': result['reason'],
                         'pnl_pct': result['pnl_pct'],
                         'pnl_usdt': result['pnl_usdt'],
                     }
@@ -159,8 +171,12 @@ class PositionManager:
                         return {
                             'action': 'TRAILING',
                             'position_id': pos['id'],
-                            'symbol': pos['symbol'],
-                            'price': current_price,
+                            'symbol': result['symbol'],
+                            'side': result['side'],
+                            'price': result['price'],
+                            'amount': result['amount'],
+                            'value_usdt': result['value_usdt'],
+                            'reason': result['reason'],
                             'pnl_pct': result['pnl_pct'],
                             'pnl_usdt': result['pnl_usdt'],
                         }

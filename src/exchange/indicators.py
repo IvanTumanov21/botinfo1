@@ -42,6 +42,11 @@ def calculate_indicators(ohlcv: List[List]) -> Optional[pd.DataFrame]:
         df['ema28'] = df['close'].ewm(span=INDICATORS["ema_slow"], adjust=False).mean()
         df['ema100'] = df['close'].ewm(span=INDICATORS["ema_trend"], adjust=False).mean()
         
+        # EMA для профессиональной стратегии
+        df['ema9'] = df['close'].ewm(span=INDICATORS.get("ema9", 9), adjust=False).mean()
+        df['ema21'] = df['close'].ewm(span=INDICATORS.get("ema21", 21), adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=INDICATORS.get("ema50", 50), adjust=False).mean()
+        
         # ================== Volume SMA ==================
         df['volume_sma20'] = df['volume'].rolling(window=INDICATORS["volume_sma"]).mean()
         
@@ -183,13 +188,27 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
             SIGNAL_CONDITIONS["max_candle_growth"]
         )
         
-        # 2. Объём ≥ 1.5x (смягчено)
+        # 2. Объём ≥ 3.0x (ПРОФЕССИОНАЛЬНАЯ СТРАТЕГИЯ - аномалия!)
         volume_spike = last['volume_ratio'] >= SIGNAL_CONDITIONS["volume_breakout_mult"]
         
-        # 3. RSI не перегрет
-        rsi_ok = last['rsi14'] <= SIGNAL_CONDITIONS["max_rsi"]
+        # 3. RSI в импульсной фазе (50-70)
+        min_rsi = SIGNAL_CONDITIONS.get("min_rsi", 0)
+        max_rsi = SIGNAL_CONDITIONS.get("max_rsi", 100)
+        rsi_ok = min_rsi <= last['rsi14'] <= max_rsi
         
-        # Опциональные (для метрик, не блокируют):
+        # 4. EMA структура (ПРОФЕССИОНАЛЬНАЯ СТРАТЕГИЯ)
+        ema_setup_ok = True
+        ema9_above_ema21 = False
+        price_above_ema50 = False
+        
+        if SIGNAL_CONDITIONS.get("require_ema_setup", False):
+            # EMA9 > EMA21 (восходящий тренд)
+            ema9_above_ema21 = last['ema9'] > last['ema21']
+            # Price > EMA50 (выше среднесрочного тренда)
+            price_above_ema50 = last['close'] > last['ema50']
+            ema_setup_ok = ema9_above_ema21 and price_above_ema50
+        
+        # Опциональные (для метрик):
         # Пробой High20
         breakout_high = last['close'] > prev_high_20
         
@@ -202,12 +221,15 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
             last['ema7'] > last['ema14']
         )
         
-        # УПРОЩЁННЫЙ ИТОГ: только growth, volume и RSI важны
-        is_breakout = growth_ok and volume_spike and rsi_ok
+        # ПРОФЕССИОНАЛЬНАЯ СТРАТЕГИЯ: growth + volume anomaly + RSI + EMA setup
+        is_breakout = growth_ok and volume_spike and rsi_ok and ema_setup_ok
         
         metrics = {
             "prev_high_20": prev_high_20,
             "current_close": last['close'],
+            "ema9": last['ema9'],
+            "ema21": last['ema21'],
+            "ema50": last['ema50'],
             "ema100": last['ema100'],
             "volume_ratio": round(last['volume_ratio'], 2),
             "candle_growth": round(candle_growth * 100, 2),
@@ -215,6 +237,9 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
             "breakout_high": breakout_high,
             "above_ema100": above_ema100,
             "ema_cross": ema_cross,
+            "ema9_above_ema21": ema9_above_ema21,
+            "price_above_ema50": price_above_ema50,
+            "ema_setup_ok": ema_setup_ok,
             "volume_spike": volume_spike,
             "growth_ok": growth_ok,
             "rsi_ok": rsi_ok,
@@ -333,3 +358,102 @@ def calculate_levels(
         "risk_pct": round((risk / entry_price) * 100, 2),
         "rr_ratio": round(rr_ratio, 2),
     }
+
+
+def detect_presignals(df: pd.DataFrame) -> Dict:
+    """
+    Определяет, выполнено ли каждое условие для сигнала (для предсигналов).
+    Используется для отправки уведомлений о парах, готовых к пампу.
+    
+    Возвращает словарь с состоянием каждого условия:
+    {
+        "conditions_met": 3,  # Количество выполненных условий
+        "volume_ok": False,
+        "growth_ok": True,
+        "rsi_ok": True,
+        "ema_setup_ok": True,
+        "details": {...}
+    }
+    """
+    if df is None or len(df) < INDICATORS["lookback_candles"] + 2:
+        return {
+            "conditions_met": 0,
+            "volume_ok": False,
+            "growth_ok": False,
+            "rsi_ok": False,
+            "ema_setup_ok": False,
+            "details": {}
+        }
+    
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        prev2 = df.iloc[-3]
+        
+        # Проверяем каждое условие
+        
+        # 1. Volume spike ≥ 3.0x
+        volume_ok = last['volume_ratio'] >= SIGNAL_CONDITIONS["volume_breakout_mult"]
+        
+        # 2. Рост свечи в диапазоне
+        candle_growth = last['candle_growth']
+        growth_ok = (
+            SIGNAL_CONDITIONS["min_candle_growth"] <= candle_growth <= 
+            SIGNAL_CONDITIONS["max_candle_growth"]
+        )
+        
+        # 3. RSI в импульсной зоне
+        min_rsi = SIGNAL_CONDITIONS.get("min_rsi", 0)
+        max_rsi = SIGNAL_CONDITIONS.get("max_rsi", 100)
+        rsi_ok = min_rsi <= last['rsi14'] <= max_rsi
+        
+        # 4. EMA структура
+        ema_setup_ok = True
+        ema9_above_ema21 = False
+        price_above_ema50 = False
+        
+        if SIGNAL_CONDITIONS.get("require_ema_setup", False):
+            ema9_above_ema21 = last['ema9'] > last['ema21']
+            price_above_ema50 = last['close'] > last['ema50']
+            ema_setup_ok = ema9_above_ema21 and price_above_ema50
+        
+        # Подсчитываем выполненные условия
+        conditions_met = sum([volume_ok, growth_ok, rsi_ok, ema_setup_ok])
+        
+        details = {
+            "volume_ratio": round(last['volume_ratio'], 2),
+            "volume_min_required": SIGNAL_CONDITIONS["volume_breakout_mult"],
+            "candle_growth": round(candle_growth * 100, 2),
+            "growth_min": SIGNAL_CONDITIONS["min_candle_growth"] * 100,
+            "growth_max": SIGNAL_CONDITIONS["max_candle_growth"] * 100,
+            "rsi": round(last['rsi14'], 1),
+            "rsi_min": min_rsi,
+            "rsi_max": max_rsi,
+            "ema9": round(last['ema9'], 6),
+            "ema21": round(last['ema21'], 6),
+            "price": round(last['close'], 6),
+            "ema50": round(last['ema50'], 6),
+            "ema9_above_ema21": ema9_above_ema21,
+            "price_above_ema50": price_above_ema50,
+        }
+        
+        return {
+            "conditions_met": conditions_met,
+            "volume_ok": volume_ok,
+            "growth_ok": growth_ok,
+            "rsi_ok": rsi_ok,
+            "ema_setup_ok": ema_setup_ok,
+            "details": details,
+        }
+        
+    except Exception as e:
+        logger.error(f"Ошибка определения предсигнала: {e}")
+        return {
+            "conditions_met": 0,
+            "volume_ok": False,
+            "growth_ok": False,
+            "rsi_ok": False,
+            "ema_setup_ok": False,
+            "details": {}
+        }
+

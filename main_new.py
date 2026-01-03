@@ -27,7 +27,8 @@ from src.database.connection import init_db
 from src.exchange import BybitExchange, MarketScanner
 from src.telegram import TelegramBot, setup_handlers
 from src.telegram.handlers import set_components
-from src.trading import OrderExecutor, PositionManager
+from src.presignals_task import start_presignals_task
+from src.trading import OrderExecutor, PositionManager, portfolio_loop
 
 from telegram.ext import Application
 
@@ -39,6 +40,8 @@ telegram_bot: TelegramBot = None
 executor: OrderExecutor = None
 position_manager: PositionManager = None
 app: Application = None
+presignals_task = None
+portfolio_task = None
 
 running = True
 
@@ -46,12 +49,37 @@ running = True
 async def scan_loop():
     """Цикл сканирования рынка"""
     global running
+    from src.database import get_db
+    from src.database.models import BotSettings
     
     logger.info("🔍 Запуск цикла сканирования...")
-    await asyncio.sleep(5)  # Даём время на инициализацию
+    
+    # При запуске сразу выключаем сканирование
+    try:
+        with get_db() as db:
+            setting = db.query(BotSettings).filter(BotSettings.key == "scan_enabled").first()
+            if not setting:
+                setting = BotSettings(key="scan_enabled", value="False")
+                db.add(setting)
+            else:
+                setting.value = "False"
+            db.commit()
+        logger.info("⏸️ Сканирование выключено по умолчанию. Включите через меню.")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки scan_enabled: {e}")
     
     while running:
         try:
+            # Проверяем, включено ли сканирование
+            with get_db() as db:
+                setting = db.query(BotSettings).filter(BotSettings.key == "scan_enabled").first()
+                scan_enabled = setting and setting.value.lower() == "true"
+            
+            if not scan_enabled:
+                # Спим и ждём, пока включат
+                await asyncio.sleep(5)
+                continue
+            
             logger.info("🔄 Начинаем сканирование...")
             # Сканируем рынок
             signals = await scanner.scan_all()
@@ -108,7 +136,7 @@ def signal_handler(sig, frame):
 
 async def main():
     """Главная функция"""
-    global exchange, scanner, telegram_bot, executor, position_manager, app, running
+    global exchange, scanner, telegram_bot, executor, position_manager, app, presignals_task, portfolio_task, running
     
     # Регистрируем обработчики сигналов
     signal.signal(signal.SIGINT, signal_handler)
@@ -172,6 +200,8 @@ async def main():
     logger.info("🔄 Запуск фоновых тасков...")
     scan_task = asyncio.create_task(scan_loop())
     position_task = asyncio.create_task(position_loop())
+    presignals_task = asyncio.create_task(start_presignals_task(telegram_bot, exchange))
+    portfolio_task = asyncio.create_task(portfolio_loop(exchange))
     logger.info("✅ Таски созданы, ожидаем сигнала завершения...")
     
     # 9. Ждём завершения (SIGTERM/SIGINT)
@@ -186,6 +216,10 @@ async def main():
     
     scan_task.cancel()
     position_task.cancel()
+    if presignals_task:
+        presignals_task.cancel()
+    if portfolio_task:
+        portfolio_task.cancel()
     
     try:
         await scan_task
@@ -194,6 +228,17 @@ async def main():
     
     try:
         await position_task
+    except asyncio.CancelledError:
+        pass
+
+    try:
+        if portfolio_task:
+            await portfolio_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        if presignals_task:
+            await presignals_task
     except asyncio.CancelledError:
         pass
     

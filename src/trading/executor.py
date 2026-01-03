@@ -18,10 +18,11 @@ class OrderExecutor:
     def __init__(self, exchange: BybitExchange):
         self.exchange = exchange
         
-    async def execute_buy_from_signal(self, signal_id: int) -> Optional[Position]:
+    async def execute_buy_from_signal(self, signal_id: int, amount_usdt_override: Optional[float] = None) -> Optional[Position]:
         """
         Исполняет покупку по сигналу.
         Создаёт лимитный ордер и позицию в БД.
+        amount_usdt_override — если передан, берём фиксированную сумму в USDT.
         """
         with get_db() as db:
             signal = db.query(Signal).filter(Signal.id == signal_id).first()
@@ -46,7 +47,10 @@ class OrderExecutor:
                 return None
             
             # Рассчитываем размер позиции
-            position_size_usdt = usdt_free * RISK_MANAGEMENT["position_size_pct"]
+            if amount_usdt_override and amount_usdt_override > 0:
+                position_size_usdt = min(amount_usdt_override, usdt_free)
+            else:
+                position_size_usdt = usdt_free * RISK_MANAGEMENT["position_size_pct"]
             
             # Проверяем риск на сделку
             risk_pct = (entry_price - stop_loss) / entry_price
@@ -70,7 +74,7 @@ class OrderExecutor:
                 logger.error(f"Не удалось создать ордер на {symbol}")
                 return None
             
-            # Сохраняем позицию в БД
+            # Сохраняем позицию в БД и возвращаем данные как словарь (не ORM-объект)
             with get_db() as db:
                 position = Position(
                     signal_id=signal_id,
@@ -107,9 +111,19 @@ class OrderExecutor:
                 signal = db.query(Signal).filter(Signal.id == signal_id).first()
                 if signal:
                     signal.status = SignalStatus.EXECUTED
+                
+                db.commit()
+                
+                position_data = {
+                    "id": position_id,
+                    "symbol": symbol,
+                    "entry_price": entry_price,
+                    "entry_amount": amount,
+                    "entry_value_usdt": position_size_usdt,
+                }
             
             logger.info(f"✅ Ордер на покупку {symbol}: {amount:.6f} @ {entry_price:.6f}")
-            return position
+            return position_data
             
         except Exception as e:
             logger.error(f"Ошибка исполнения покупки: {e}")
@@ -217,6 +231,20 @@ class OrderExecutor:
                     position.status = PositionStatus.PARTIAL_TP1
                 elif reason == "TP2":
                     position.status = PositionStatus.PARTIAL_TP2
+                
+                db.commit()
+                
+                # Формируем данные для возврата
+                trade_data = {
+                    'side': 'SELL',
+                    'symbol': symbol,
+                    'price': current_price,
+                    'amount': sell_amount,
+                    'value_usdt': sell_value,
+                    'reason': reason,
+                    'pnl_usdt': pnl_usdt,
+                    'pnl_pct': pnl_pct,
+                }
                 
                 # Обновляем дневную статистику если закрыта
                 if position.status in [

@@ -53,19 +53,19 @@ INDICATORS = {
 
 # ================== УСЛОВИЯ СИГНАЛА ==================
 SIGNAL_CONDITIONS = {
-    # Фаза накопления
-    "accumulation_range_mult": 2.5,    # Диапазон ≤ 2.5 × ATR
-    "accumulation_volume_ratio": 0.8,  # Объём ниже 80% среднего
+    # Фаза накопления (ослаблено для ловли пампов)
+    "accumulation_range_mult": 5.0,    # Диапазон ≤ 5.0 × ATR (было 2.5)
+    "accumulation_volume_ratio": 1.5,  # Объём ниже 150% среднего (было 0.8)
     
     # Импульс (breakout)
-    "volume_breakout_mult": 2.0,       # Объём ≥ 2 × SMA20
-    "max_candle_growth": 0.08,         # Рост свечи ≤ 8%
-    "min_candle_growth": 0.005,        # Рост свечи ≥ 0.5%
+    "volume_breakout_mult": 1.5,       # Объём ≥ 1.5 × SMA20 (было 2.0)
+    "max_candle_growth": 0.15,         # Рост свечи ≤ 15% (было 8%)
+    "min_candle_growth": 0.02,         # Рост свечи ≥ 2% (было 0.5%)
     
     # Фильтры качества
-    "max_rsi": 70,                     # RSI ≤ 70
-    "max_spread": 0.006,               # Спред ≤ 0.6%
-    "min_bid_ask_ratio": 0.8,          # bid/ask ≥ 0.8
+    "max_rsi": 75,                     # RSI ≤ 75 (было 70)
+    "max_spread": 0.008,               # Спред ≤ 0.8%
+    "min_bid_ask_ratio": 0.7,          # bid/ask ≥ 0.7
 }
 
 # ================== РИСК-МЕНЕДЖМЕНТ ==================
@@ -89,10 +89,10 @@ RISK_MANAGEMENT = {
 
 # ================== АНТИ-FOMO ЗАЩИТА ==================
 ANTI_FOMO = {
-    "signal_cooldown_hours": 6,        # 1 сигнал на пару в 6 часов
-    "max_from_daily_low_pct": 0.10,    # Не покупать если +10% от лоя дня
-    "btc_drop_threshold": -0.015,      # BTC падает -1.5% за 1ч → молчим
-    "night_hours_utc": (0, 6),         # Ночь UTC → не торгуем
+    "signal_cooldown_hours": 2,        # 1 сигнал на пару в 2 часа (было 6)
+    "max_from_daily_low_pct": 0.20,    # Не покупать если +20% от лоя дня (было 10%)
+    "btc_drop_threshold": -0.03,       # BTC падает -3% за 1ч → молчим (было -1.5%)
+    "night_hours_utc": (2, 5),         # Ночь UTC → не торгуем (сужено)
 }
 
 # ================== ИНТЕРВАЛЫ СКАНИРОВАНИЯ ==================

@@ -96,11 +96,9 @@ def detect_accumulation(df: pd.DataFrame) -> Tuple[bool, Dict]:
     """
     Определяет фазу накопления за последние 20 свечей.
     
-    Условия:
-    1. Диапазон цены ≤ 2.5 × ATR
-    2. EMA7/14/28 сплетены (близко друг к другу)
-    3. EMA100 плоская
-    4. Средний объём ниже нормы
+    УПРОЩЁННЫЕ условия (для ловли пампов):
+    1. Диапазон цены ≤ 5.0 × ATR (смягчено)
+    2. Объём за период ниже 150% среднего (смягчено)
     
     Возвращает:
     - bool: есть накопление или нет
@@ -114,26 +112,26 @@ def detect_accumulation(df: pd.DataFrame) -> Tuple[bool, Dict]:
         recent = df.tail(lookback)
         last = df.iloc[-1]
         
-        # 1. Диапазон цены
+        # 1. Диапазон цены (основной критерий)
         price_range = recent['high'].max() - recent['low'].min()
         atr = last['atr14']
         range_ratio = price_range / atr if atr > 0 else 999
         range_ok = range_ratio <= SIGNAL_CONDITIONS["accumulation_range_mult"]
         
-        # 2. EMA сплетение (разница < 1% от цены)
+        # 2. EMA сплетение (опционально - не блокирует)
         ema_spread = last['ema_spread']
-        ema_tangled = ema_spread < 0.01
+        ema_tangled = ema_spread < 0.02  # смягчено до 2%
         
-        # 3. EMA100 плоская (наклон < 0.5%)
+        # 3. EMA100 наклон (опционально - не блокирует)
         ema100_slope = abs(last['ema100_slope']) if pd.notna(last['ema100_slope']) else 0
-        ema100_flat = ema100_slope < 0.005
+        ema100_flat = ema100_slope < 0.02  # смягчено до 2%
         
-        # 4. Объём ниже среднего
+        # 4. Объём за период (основной критерий)
         avg_volume_ratio = recent['volume_ratio'].mean()
         volume_low = avg_volume_ratio < SIGNAL_CONDITIONS["accumulation_volume_ratio"]
         
-        # Итог
-        is_accumulation = range_ok and ema_tangled and ema100_flat and volume_low
+        # УПРОЩЁННЫЙ ИТОГ: только range и volume важны
+        is_accumulation = range_ok and volume_low
         
         metrics = {
             "range_ratio": round(range_ratio, 2),
@@ -157,11 +155,10 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
     """
     Определяет импульсный пробой (breakout).
     
-    Условия (на текущей или предыдущей свече):
-    1. Цена пробивает High за 20 свечей
-    2. Закрытие выше EMA100
-    3. EMA7 пересекает EMA14 снизу вверх
-    4. Объём ≥ 2 × SMA20
+    УПРОЩЁННЫЕ условия (для ловли пампов):
+    1. Рост текущей свечи в диапазоне 2-15%
+    2. Объём ≥ 1.5 × SMA20
+    3. RSI ≤ 75
     
     Возвращает:
     - bool: есть пробой или нет
@@ -179,25 +176,55 @@ def detect_breakout(df: pd.DataFrame) -> Tuple[bool, Dict]:
         lookback = INDICATORS["lookback_candles"]
         prev_high_20 = df['high'].iloc[-lookback-1:-1].max()
         
-        # 1. Пробой High20
+        # 1. Рост свечи в диапазоне
+        candle_growth = last['candle_growth']
+        growth_ok = (
+            SIGNAL_CONDITIONS["min_candle_growth"] <= candle_growth <= 
+            SIGNAL_CONDITIONS["max_candle_growth"]
+        )
+        
+        # 2. Объём ≥ 1.5x (смягчено)
+        volume_spike = last['volume_ratio'] >= SIGNAL_CONDITIONS["volume_breakout_mult"]
+        
+        # 3. RSI не перегрет
+        rsi_ok = last['rsi14'] <= SIGNAL_CONDITIONS["max_rsi"]
+        
+        # Опциональные (для метрик, не блокируют):
+        # Пробой High20
         breakout_high = last['close'] > prev_high_20
         
-        # 2. Закрытие выше EMA100
+        # Закрытие выше EMA100
         above_ema100 = last['close'] > last['ema100']
         
-        # 3. EMA7 пересекает EMA14 снизу вверх
+        # EMA7 пересекает EMA14 снизу вверх
         ema_cross = (
             (prev['ema7'] <= prev['ema14'] or prev2['ema7'] <= prev2['ema14']) and
             last['ema7'] > last['ema14']
         )
         
-        # 4. Объём ≥ 2x
-        volume_spike = last['volume_ratio'] >= SIGNAL_CONDITIONS["volume_breakout_mult"]
-        
-        # Итог
-        is_breakout = breakout_high and above_ema100 and ema_cross and volume_spike
+        # УПРОЩЁННЫЙ ИТОГ: только growth, volume и RSI важны
+        is_breakout = growth_ok and volume_spike and rsi_ok
         
         metrics = {
+            "prev_high_20": prev_high_20,
+            "current_close": last['close'],
+            "ema100": last['ema100'],
+            "volume_ratio": round(last['volume_ratio'], 2),
+            "candle_growth": round(candle_growth * 100, 2),
+            "rsi": round(last['rsi14'], 1),
+            "breakout_high": breakout_high,
+            "above_ema100": above_ema100,
+            "ema_cross": ema_cross,
+            "volume_spike": volume_spike,
+            "growth_ok": growth_ok,
+            "rsi_ok": rsi_ok,
+        }
+        
+        return is_breakout, metrics
+        
+    except Exception as e:
+        logger.error(f"Ошибка определения пробоя: {e}")
+        return False, {}
             "prev_high_20": prev_high_20,
             "current_close": last['close'],
             "ema100": last['ema100'],

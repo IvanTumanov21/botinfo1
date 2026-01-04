@@ -625,15 +625,34 @@ async def handle_close_position(query, position_id: int):
                         await telegram_bot.send_message(
                             f"✅ <b>Позиция закрыта!</b>\n\n"
                             f"📍 {symbol}\n"
-                            f"💵 Цена выхода: {trade.price:.6f}\n"
-                            f"📊 Объём: {trade.amount:.6f}"
+                            f"💵 Цена выхода: {trade['price']:.6f}\n"
+                            f"📊 Объём: {trade['amount']:.6f}\n"
+                            f"💰 P&L: {trade['pnl_pct']:+.2f}% (${trade['pnl_usdt']:+.2f})"
                         )
                 else:
-                    logger.error(f"❌ Не удалось закрыть позицию {position_id}")
-                    if telegram_bot:
-                        await telegram_bot.send_message(
-                            f"❌ Не удалось закрыть позицию {symbol}"
-                        )
+                    # Проверяем, может позиция уже закрыта
+                    with get_db() as db:
+                        position = db.query(Position).filter(Position.id == position_id).first()
+                        if position and position.status in [
+                            PositionStatus.CLOSED_MANUAL,
+                            PositionStatus.CLOSED_TP,
+                            PositionStatus.CLOSED_SL
+                        ]:
+                            logger.info(f"ℹ️ Позиция {symbol} уже была закрыта ({position.status.value})")
+                            if telegram_bot:
+                                await telegram_bot.send_message(
+                                    f"ℹ️ <b>Позиция уже закрыта</b>\n\n"
+                                    f"📍 {symbol}\n"
+                                    f"Статус: {position.status.value}\n"
+                                    f"Причина: {position.close_reason or 'неизвестно'}"
+                                )
+                        else:
+                            logger.error(f"❌ Не удалось закрыть позицию {position_id}")
+                            if telegram_bot:
+                                await telegram_bot.send_message(
+                                    f"❌ Не удалось закрыть позицию {symbol}\n"
+                                    f"Возможно недостаточно баланса или актив уже продан"
+                                )
             except Exception as e:
                 logger.error(f"❌ Ошибка при закрытии: {e}")
                 if telegram_bot:

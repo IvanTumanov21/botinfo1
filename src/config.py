@@ -77,7 +77,7 @@ SIGNAL_CONDITIONS = {
 RISK_MANAGEMENT = {
     "position_size_pct": 0.10,         # 10% депозита на сделку
     "max_risk_per_trade": 0.01,        # Риск ≤ 1% депозита
-    "max_positions": 3,                # Макс 3 активных позиции
+    "max_positions": 10,               # Макс 10 активных позиций
     "max_daily_losses": 2,             # Макс 2 стопа в день → пауза
     
     # Take Profit уровни

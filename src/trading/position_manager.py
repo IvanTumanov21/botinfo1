@@ -62,6 +62,67 @@ class PositionManager:
     async def _check_position(self, pos: dict) -> Optional[dict]:
         """Проверяет одну позицию"""
         try:
+            # Проверяем, есть ли актив на балансе (синхронизация с биржей)
+            balance = await self.exchange.get_balance()
+            currency = pos['symbol'].split('/')[0]  # IO/USDT -> IO
+            
+            # Если актива вообще нет в балансе (API не вернул его), считаем что его 0
+            amount_on_exchange = 0
+            if balance and currency in balance:
+                amount_on_exchange = float(balance[currency].get('total', 0) or 0)
+            
+            # Если на бирже осталось меньше 5% от позиции (учитываем dust ~0.06), считаем закрытой
+            # Минимальный порог - 0.1 токена (dust)
+            dust_threshold = max(0.1, pos['current_amount'] * 0.05)
+            
+            if amount_on_exchange < dust_threshold:
+                logger.warning(f"⚠️ Позиция {pos['symbol']} закрыта вручную на бирже (остаток {amount_on_exchange:.4f} < {dust_threshold:.4f}), синхронизируем БД")
+                
+                with get_db() as db:
+                    position = db.query(Position).filter(Position.id == pos['id']).first()
+                    if position:
+                        # Создаём Trade запись для истории
+                        from src.database.models import Trade
+                        
+                        # Пытаемся получить текущую цену для расчёта PnL
+                        try:
+                            ticker = await self.exchange.get_ticker(pos['symbol'])
+                            current_price = ticker['last'] if ticker else pos['entry_price']
+                        except:
+                            current_price = pos['entry_price']
+                        
+                        # Рассчитываем PnL
+                        pnl_usdt = (current_price - pos['entry_price']) * pos['current_amount']
+                        pnl_pct = (current_price / pos['entry_price'] - 1) * 100
+                        
+                        trade = Trade(
+                            position_id=pos['id'],
+                            symbol=pos['symbol'],
+                            side="SELL",
+                            price=current_price,
+                            amount=pos['current_amount'],
+                            value_usdt=pos['current_amount'] * current_price,
+                            reason="MANUAL_EXTERNAL",
+                            pnl_usdt=pnl_usdt,
+                            pnl_pct=pnl_pct,
+                        )
+                        db.add(trade)
+                        
+                        position.status = PositionStatus.CLOSED_MANUAL
+                        position.closed_at = datetime.now(timezone.utc)
+                        position.close_reason = "MANUAL_EXTERNAL"
+                        position.close_price = current_price
+                        position.total_pnl_usdt = pnl_usdt
+                        
+                        db.commit()
+                
+                return {
+                    'action': 'SYNC_CLOSED',
+                    'position_id': pos['id'],
+                    'symbol': pos['symbol'],
+                    'reason': 'Закрыто вручную на бирже'
+                }
+            
             # Получаем текущую цену
             ticker = await self.exchange.get_ticker(pos['symbol'])
             if not ticker:

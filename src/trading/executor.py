@@ -163,6 +163,38 @@ class OrderExecutor:
             sell_amount = min(amount, position.current_amount)
         
         try:
+            # Проверяем реальный баланс на бирже (синхронизация)
+            balance = await self.exchange.get_balance()
+            currency = symbol.split('/')[0]  # H/USDT -> H
+            
+            actual_balance = 0
+            if balance and currency in balance:
+                actual_balance = float(balance[currency].get('total', 0) or 0)
+            
+            logger.info(f"🔍 Проверка баланса {currency}: БД={sell_amount:.6f}, Биржа={actual_balance:.8f}")
+            
+            # Если реальный баланс меньше, используем его
+            if actual_balance < sell_amount:
+                if actual_balance < 0.0001:  # Почти ничего нет
+                    logger.warning(f"⚠️ На балансе {currency} только {actual_balance:.8f}, позиция закрыта вручную")
+                    
+                    # Обновляем БД - помечаем как закрытую вручную
+                    with get_db() as db:
+                        pos = db.query(Position).filter(Position.id == position_id).first()
+                        if pos:
+                            pos.status = PositionStatus.CLOSED_MANUAL
+                            pos.closed_at = datetime.now(timezone.utc)
+                            pos.close_reason = "MANUAL_EXTERNAL"
+                            pos.close_price = entry_price
+                            pos.total_pnl_usdt = 0
+                            db.commit()
+                            logger.info(f"✅ Позиция {position_id} синхронизирована как CLOSED_MANUAL")
+                    
+                    return None
+                    
+                logger.warning(f"⚠️ Баланс {currency} на бирже ({actual_balance:.6f}) меньше чем в БД ({sell_amount:.6f}), используем реальный")
+                sell_amount = actual_balance
+            
             # Получаем текущую цену
             ticker = await self.exchange.get_ticker(symbol)
             current_price = ticker['last'] if ticker else entry_price

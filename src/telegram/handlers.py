@@ -623,14 +623,22 @@ async def handle_close_position(query, position_id: int):
                     logger.info(f"✅ Позиция {symbol} закрыта вручную")
                     logger.debug(f"Trade data type: {type(trade)}, keys: {trade.keys() if isinstance(trade, dict) else 'NOT A DICT'}")
                     if telegram_bot:
-                        await telegram_bot.send_message(
-                            f"✅ <b>Позиция закрыта!</b>\n\n"
-                            f"📍 {symbol}\n"
-                            f"💵 Цена выхода: {trade['price']:.6f}\n"
-                            f"📊 Объём: {trade['amount']:.6f}\n"
-                            f"💰 P&L: {trade['pnl_pct']:+.2f}% (${trade['pnl_usdt']:+.2f})"
-                        )
-                        logger.debug(f"✅ Сообщение о закрытии отправлено успешно")
+                        try:
+                            price = trade.get('price', 0) if isinstance(trade, dict) else getattr(trade, 'price', 0)
+                            amount = trade.get('amount', 0) if isinstance(trade, dict) else getattr(trade, 'amount', 0)
+                            pnl_pct = trade.get('pnl_pct', 0) if isinstance(trade, dict) else getattr(trade, 'pnl_pct', 0)
+                            pnl_usdt = trade.get('pnl_usdt', 0) if isinstance(trade, dict) else getattr(trade, 'pnl_usdt', 0)
+                            
+                            await telegram_bot.send_message(
+                                f"✅ <b>Позиция закрыта!</b>\n\n"
+                                f"📍 {symbol}\n"
+                                f"💵 Цена выхода: {price:.6f}\n"
+                                f"📊 Объём: {amount:.6f}\n"
+                                f"💰 P&L: {pnl_pct:+.2f}% (${pnl_usdt:+.2f})"
+                            )
+                            logger.debug(f"✅ Сообщение о закрытии отправлено успешно")
+                        except Exception as send_err:
+                            logger.error(f"❌ Ошибка отправки сообщения: {send_err}, trade type: {type(trade)}")
                 else:
                     # Проверяем, может позиция уже закрыта
                     with get_db() as db:

@@ -48,6 +48,7 @@ class PositionManager:
                     'max_price': p.max_price,
                     'trailing_stop': p.trailing_stop,
                     'status': p.status,
+                    'entry_time': p.entry_time,
                 }
                 for p in positions
             ]
@@ -62,6 +63,18 @@ class PositionManager:
     async def _check_position(self, pos: dict) -> Optional[dict]:
         """Проверяет одну позицию"""
         try:
+            # Если позиция создана менее 3 минут назад, пропускаем проверку баланса
+            # (даем время на исполнение лимитного ордера)
+            from datetime import timedelta
+            time_since_entry = datetime.now(timezone.utc) - pos['entry_time']
+            if time_since_entry < timedelta(minutes=3):
+                # Только проверяем цену для trailing stop, но не закрываем
+                ticker = await self.exchange.get_ticker(pos['symbol'])
+                if ticker:
+                    current_price = ticker['last']
+                    await self._update_trailing(pos['id'], current_price, pos['entry_price'])
+                return None
+            
             # Проверяем, есть ли актив на балансе (синхронизация с биржей)
             balance = await self.exchange.get_balance()
             currency = pos['symbol'].split('/')[0]  # IO/USDT -> IO

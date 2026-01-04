@@ -189,15 +189,28 @@ class TelegramBot:
     
     async def send_trade_executed(self, trade_data: Dict):
         """Отправляет уведомление об исполненной сделке"""
-        side_emoji = "🟢" if trade_data['side'] == "BUY" else "🔴"
+        # Особый случай - синхронизация позиций
+        if trade_data.get('action') == 'SYNC_CLOSED':
+            text = f"""
+⚠️ <b>Синхронизация позиции</b>
+
+<b>Пара:</b> {trade_data['symbol']}
+<b>Статус:</b> Закрыта вручную на бирже
+
+Позиция обновлена в базе данных.
+"""
+            await self.send_message(text)
+            return
+        
+        side_emoji = "🟢" if trade_data.get('side') == "BUY" else "🔴"
         
         text = f"""
 {side_emoji} <b>Сделка исполнена</b>
 
 <b>Пара:</b> {trade_data['symbol']}
-<b>Тип:</b> {trade_data['side']}
-<b>Цена:</b> {trade_data['price']:.6f}
-<b>Объём:</b> {trade_data['amount']:.4f} (~${trade_data['value_usdt']:.2f})
+<b>Тип:</b> {trade_data.get('side', 'N/A')}
+<b>Цена:</b> {trade_data.get('price', 0):.6f}
+<b>Объём:</b> {trade_data.get('amount', 0):.4f} (~${trade_data.get('value_usdt', 0):.2f})
 <b>Причина:</b> {trade_data.get('reason', 'SIGNAL')}
 """
         

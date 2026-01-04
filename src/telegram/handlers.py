@@ -621,6 +621,7 @@ async def handle_close_position(query, position_id: int):
                 
                 if trade:
                     logger.info(f"✅ Позиция {symbol} закрыта вручную")
+                    logger.debug(f"Trade data type: {type(trade)}, keys: {trade.keys() if isinstance(trade, dict) else 'NOT A DICT'}")
                     if telegram_bot:
                         await telegram_bot.send_message(
                             f"✅ <b>Позиция закрыта!</b>\n\n"
@@ -629,6 +630,7 @@ async def handle_close_position(query, position_id: int):
                             f"📊 Объём: {trade['amount']:.6f}\n"
                             f"💰 P&L: {trade['pnl_pct']:+.2f}% (${trade['pnl_usdt']:+.2f})"
                         )
+                        logger.debug(f"✅ Сообщение о закрытии отправлено успешно")
                 else:
                     # Проверяем, может позиция уже закрыта
                     with get_db() as db:

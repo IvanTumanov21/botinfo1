@@ -120,7 +120,12 @@ class PositionManager:
                     'action': 'SYNC_CLOSED',
                     'position_id': pos['id'],
                     'symbol': pos['symbol'],
-                    'reason': 'Закрыто вручную на бирже'
+                    'side': 'SELL',
+                    'reason': 'Закрыто вручную на бирже',
+                    'price': current_price,
+                    'amount': pos['current_amount'],
+                    'pnl_pct': pnl_pct,
+                    'pnl_usdt': pnl_usdt,
                 }
             
             # Получаем текущую цену
